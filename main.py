@@ -9,8 +9,15 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 # ========== НАСТРОЙКИ ==========
 API_KEY = os.getenv("API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///./mybase.db"
+
 JITLER_URL = "https://api.jitler.top"
 JITLER_KEYS = [k.strip() for k in os.getenv("JITLER_KEYS", "").split(",") if k.strip()]
+
+PANT_URL = "https://pant-api.cc.cd"
+PANT_TOKEN = os.getenv("PANT_TOKEN", "")
+
+HTMLWEB_URL = "https://htmlweb.ru/geo/api.php"
+
 CACHE_TTL = 60 * 60 * 24  # 24 часа
 
 if DATABASE_URL.startswith("postgres://"):
@@ -53,6 +60,14 @@ class Person(Base):
 
 class JitlerCache(Base):
     __tablename__ = "jitler_cache"
+    id = Column(Integer, primary_key=True)
+    query = Column(String, index=True, unique=True)
+    type = Column(String)
+    response = Column(Text)
+    created = Column(Integer)
+
+class PantCache(Base):
+    __tablename__ = "pant_cache"
     id = Column(Integer, primary_key=True)
     query = Column(String, index=True, unique=True)
     type = Column(String)
@@ -111,10 +126,8 @@ def normalize_phone(s: str) -> str:
 
 # ========== JITLER ==========
 async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
-    """Типы: number, sherlock, funstat, vks."""
     if not JITLER_KEYS:
         return {"error": "no jitler keys"}
-
     async with httpx.AsyncClient(timeout=60) as client:
         for key in JITLER_KEYS:
             try:
@@ -127,10 +140,9 @@ async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
                     },
                 )
                 if r.status_code in (429, 403):
-                    continue  # лимит/блок — берём следующий ключ
+                    continue
                 if r.status_code == 200:
                     data = r.json()
-                    # А) создана задача
                     if "id" in data and "response" not in data:
                         task_id = data["id"]
                         for _ in range(30):
@@ -141,7 +153,7 @@ async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
                             )
                             if r2.status_code == 200:
                                 return r2.json()
-                            if r2.status_code not in (501,):
+                            if r2.status_code != 501:
                                 break
                     return data
                 if r.status_code == 501:
@@ -158,22 +170,69 @@ async def jitler_cached(db: Session, type_: str, query: str, page: int = 1) -> d
             return json.loads(cached.response)
         except Exception:
             pass
-
     result = await jitler_request(type_, query, page)
-
     if "error" not in result:
         if cached:
             cached.response = json.dumps(result, ensure_ascii=False)
             cached.created = int(time.time())
         else:
             db.add(JitlerCache(
-                query=cache_key,
-                type=type_,
+                query=cache_key, type=type_,
                 response=json.dumps(result, ensure_ascii=False),
                 created=int(time.time()),
             ))
         db.commit()
     return result
+
+# ========== PANT ==========
+async def pant_request(endpoint: str, params: dict) -> dict:
+    if not PANT_TOKEN:
+        return {"error": "no pant token"}
+    params["token"] = PANT_TOKEN
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(f"{PANT_URL}/{endpoint}", params=params)
+            try:
+                return r.json()
+            except Exception:
+                return {"error": r.status_code, "text": r.text}
+    except Exception as e:
+        return {"error": str(e)}
+
+async def pant_cached(db: Session, endpoint: str, query: str) -> dict:
+    cache_key = f"pant:{endpoint}:{query.lower()}"
+    cached = db.query(PantCache).filter(PantCache.query == cache_key).first()
+    if cached and (time.time() - cached.created) < CACHE_TTL:
+        try:
+            return json.loads(cached.response)
+        except Exception:
+            pass
+    params = {"phone": query} if endpoint == "search_phone" else {"q": query}
+    result = await pant_request(endpoint, params)
+    if "error" not in result:
+        if cached:
+            cached.response = json.dumps(result, ensure_ascii=False)
+            cached.created = int(time.time())
+        else:
+            db.add(PantCache(
+                query=cache_key, type=endpoint,
+                response=json.dumps(result, ensure_ascii=False),
+                created=int(time.time()),
+            ))
+        db.commit()
+    return result
+
+# ========== HTMLWEB ==========
+async def htmlweb_request(def_code: str) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(HTMLWEB_URL, params={"json": "", "telcod": def_code})
+            try:
+                return r.json()
+            except Exception:
+                return {"error": r.status_code}
+    except Exception as e:
+        return {"error": str(e)}
 
 # ========== ПРИЛОЖЕНИЕ ==========
 app = FastAPI(title="My Base API")
@@ -182,7 +241,7 @@ app = FastAPI(title="My Base API")
 def root():
     return {"status": "ok"}
 
-# -------- 1. ПОИСК ПО НОМЕРУ (база + Jitler number) --------
+# -------- 1. ПОИСК ПО НОМЕРУ --------
 @app.get("/phone")
 async def search_phone(
     q: str,
@@ -191,17 +250,29 @@ async def search_phone(
     db: Session = Depends(get_db),
 ):
     norm = normalize_phone(q)
+
     local = db.query(Person).filter(
         func.regexp_replace(Person.phone, r"\D", "", "g").like(f"%{norm}%")
     ).limit(20).all()
 
     jitler = await jitler_cached(db, "number", norm, page)
+    pant = await pant_cached(db, "search_phone", norm)
+
+    htmlweb = {}
+    if norm.startswith("7") and len(norm) >= 4:
+        htmlweb = await htmlweb_request(norm[1:4])
+    elif len(norm) >= 3:
+        htmlweb = await htmlweb_request(norm[:3])
 
     return {
         "query": q,
         "type": "phone",
         "local": [PersonResponse.model_validate(p).model_dump() for p in local],
-        "external": jitler,
+        "external": {
+            "jitler": jitler,
+            "pant": pant,
+            "htmlweb": htmlweb,
+        },
     }
 
 # -------- 2. ПОИСК ПО TELEGRAM ID / @USERNAME --------
@@ -221,17 +292,20 @@ async def search_telegram(
 
     clean = q.lstrip("@").strip()
 
-    # Jitler: sherlock + funstat (оба)
     sherlock = await jitler_cached(db, "sherlock", clean, page)
     funstat = await jitler_cached(db, "funstat", clean, page)
+    pant = await pant_cached(db, "search", clean)
 
     return {
         "query": q,
         "type": "telegram",
         "local": [PersonResponse.model_validate(p).model_dump() for p in local],
         "external": {
-            "sherlock": sherlock,
-            "funstat": funstat,
+            "jitler": {
+                "sherlock": sherlock,
+                "funstat": funstat,
+            },
+            "pant": pant,
         },
     }
 
@@ -337,7 +411,7 @@ def search_address(
         "local": [PersonResponse.model_validate(p).model_dump() for p in local],
     }
 
-# -------- 7. ДОПОЛНИТЕЛЬНЫЙ ПОИСК (extra) --------
+# -------- 7. ДОПОЛНИТЕЛЬНЫЙ ПОИСК --------
 @app.get("/extra")
 def search_extra(
     q: str,
@@ -353,7 +427,7 @@ def search_extra(
         "local": [PersonResponse.model_validate(p).model_dump() for p in local],
     }
 
-# -------- 8. VKS (Jitler vks) --------
+# -------- 8. VKS --------
 @app.get("/vks")
 async def search_vks(
     q: str,
@@ -363,6 +437,43 @@ async def search_vks(
 ):
     jitler = await jitler_cached(db, "vks", q, page)
     return {"query": q, "type": "vks", "external": jitler}
+
+# -------- 9. ПОИСК ПО НЕПОЛНЫМ ДАННЫМ --------
+@app.get("/ppnd")
+def ppnd_search(
+    q: str,
+    api_key: str = Depends(check_api_key),
+    db: Session = Depends(get_db),
+):
+    parts = [p.strip().lower() for p in q.replace(" ", "_").split("_") if p.strip()]
+    if not parts:
+        raise HTTPException(400, "Пустой запрос")
+
+    conditions = []
+    for part in parts:
+        conditions.append(func.lower(Person.fio).like(f"%{part}%"))
+        conditions.append(func.lower(Person.address).like(f"%{part}%"))
+        conditions.append(func.lower(Person.region).like(f"%{part}%"))
+        conditions.append(func.lower(Person.country).like(f"%{part}%"))
+        conditions.append(func.lower(Person.dob).like(f"%{part}%"))
+        conditions.append(func.lower(Person.extra).like(f"%{part}%"))
+
+    rows = db.query(Person).filter(or_(*conditions)).limit(100).all()
+
+    results = []
+    for p in rows:
+        text = " ".join([
+            str(p.fio or ""), str(p.address or ""), str(p.region or ""),
+            str(p.country or ""), str(p.dob or ""), str(p.extra or ""),
+        ]).lower()
+        if all(part in text for part in parts):
+            results.append(p)
+
+    return {
+        "query": q,
+        "found": len(results),
+        "matches": [PersonResponse.model_validate(p).model_dump() for p in results],
+    }
 
 # -------- ВСПОМОГАТЕЛЬНЫЕ --------
 @app.get("/persons", response_model=List[PersonResponse])
