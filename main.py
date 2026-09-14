@@ -267,10 +267,12 @@ async def search_telegram(q: str, page: int = 1, api_key: str = Depends(check_ap
         func.lower(Person.telegram).like(f"%{q.lower()}%"),
         func.lower(Person.extra).like(f"%{q.lower()}%"),
     )).limit(20).all()
-    clean = q.lstrip("@").strip()
-    sherlock = await jitler_cached(db, "sherlock", clean, page)
-    funstat = await jitler_cached(db, "funstat", clean, page)
-    pant = await pant_cached(db, "search", clean)
+    clean = q.lstrip("@").strip()        # для Jitler (без @)
+raw = q.strip()                       # для Pant (как есть, с @)
+
+sherlock = await jitler_cached(db, "sherlock", clean, page)
+funstat = await jitler_cached(db, "funstat", clean, page)
+pant = await pant_cached(db, "search", raw)
     return {
         "query": q, "type": "telegram",
         "local": [PersonResponse.model_validate(p).model_dump() for p in local],
