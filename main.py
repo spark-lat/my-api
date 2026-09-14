@@ -132,6 +132,20 @@ def make_uniq(phone, fio, dob):
     raw = f"{(fio or '').strip().lower()}|{(dob or '').strip()}"
     return "f:" + hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
 
+def tg_format(q: str) -> str:
+    """Оба API хотят @ для username. Числовой ID — как есть."""
+    q = q.strip()
+    if not q:
+        return q
+    # если это просто цифры — не трогаем
+    if re.fullmatch(r"\d+", q):
+        return q
+    # если уже с @ — оставляем
+    if q.startswith("@"):
+        return q
+    # иначе добавляем @
+    return "@" + q
+
 # ========== JITLER ==========
 async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
     if not JITLER_KEYS:
@@ -177,12 +191,17 @@ async def jitler_cached(db: Session, type_: str, query: str, page: int = 1) -> d
     cached = db.query(JitlerCache).filter(JitlerCache.query == cache_key).first()
     if cached and (time.time() - cached.created) < CACHE_TTL:
         try:
-            return json.loads(cached.response)
+            data = json.loads(cached.response)
+            err = str(data.get("error", "")) if isinstance(data, dict) else ""
+            if "all jitler keys failed" not in err and "Неправильный query" not in err:
+                return data
+            db.delete(cached)
+            db.commit()
         except Exception:
             pass
     result = await jitler_request(type_, query, page)
-    # Кэшируем только успешные ответы (без error)
-    if "error" not in result:
+    is_bad = isinstance(result, dict) and "error" in result
+    if not is_bad:
         if cached:
             cached.response = json.dumps(result, ensure_ascii=False)
             cached.created = int(time.time())
@@ -210,43 +229,26 @@ async def pant_request(endpoint: str, params: dict) -> dict:
 async def pant_cached(db: Session, endpoint: str, query: str) -> dict:
     cache_key = f"pant:{endpoint}:{query.lower()}"
     cached = db.query(PantCache).filter(PantCache.query == cache_key).first()
-
     if cached and (time.time() - cached.created) < CACHE_TTL:
         try:
             data = json.loads(cached.response)
             err = str(data.get("error", "")) if isinstance(data, dict) else ""
-            # Не кэшируем "Invalid format" и прочие 400 — пробуем заново
-            if err and "400" not in err:
+            if "400" not in err:
                 return data
-            if not err:
-                return data
-            # Если 400 — удаляем и пробуем снова
             db.delete(cached)
             db.commit()
         except Exception:
             pass
 
-    async def try_q(q_val):
-        if endpoint == "search_phone":
-            return await pant_request(endpoint, {"phone": q_val})
-        return await pant_request(endpoint, {"q": q_val})
+    if endpoint == "search_phone":
+        params = {"phone": query}
+    else:
+        params = {"q": query}
 
-    # Первая попытка — как есть
-    result = await try_q(query)
+    result = await pant_request(endpoint, params)
 
-    # Если 400 Invalid format — попробуем поменять формат
     err = str(result.get("error", "")) if isinstance(result, dict) else ""
-    if "400" in err or "Invalid format" in err:
-        if endpoint == "search":
-            if query.startswith("@"):
-                alt = query.lstrip("@").strip()
-            else:
-                alt = "@" + query.strip()
-            result = await try_q(alt)
-
-    # Кэшируем только не-400
-    err2 = str(result.get("error", "")) if isinstance(result, dict) else ""
-    if "400" not in err2:
+    if "400" not in err:
         if cached:
             cached.response = json.dumps(result, ensure_ascii=False)
             cached.created = int(time.time())
@@ -254,7 +256,6 @@ async def pant_cached(db: Session, endpoint: str, query: str) -> dict:
             db.add(PantCache(query=cache_key, type=endpoint,
                 response=json.dumps(result, ensure_ascii=False), created=int(time.time())))
         db.commit()
-
     return result
 
 # ========== HTMLWEB ==========
@@ -304,12 +305,12 @@ async def search_telegram(q: str, page: int = 1, api_key: str = Depends(check_ap
         func.lower(Person.extra).like(f"%{q.lower()}%"),
     )).limit(20).all()
 
-    clean = q.lstrip("@").strip()   # для Jitler
-    raw = q.strip()                 # для Pant (с @, как есть)
+    # Оба API хотят @ для username. Числовой ID — как есть.
+    formatted = tg_format(q)
 
-    sherlock = await jitler_cached(db, "sherlock", clean, page)
-    funstat = await jitler_cached(db, "funstat", clean, page)
-    pant = await pant_cached(db, "search", raw)
+    sherlock = await jitler_cached(db, "sherlock", formatted, page)
+    funstat = await jitler_cached(db, "funstat", formatted, page)
+    pant = await pant_cached(db, "search", formatted)
 
     return {
         "query": q, "type": "telegram",
