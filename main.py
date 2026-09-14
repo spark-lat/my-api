@@ -136,8 +136,9 @@ def make_uniq(phone, fio, dob):
 async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
     if not JITLER_KEYS:
         return {"error": "no jitler keys"}
+    errors = []
     async with httpx.AsyncClient(timeout=60) as client:
-        for key in JITLER_KEYS:
+        for i, key in enumerate(JITLER_KEYS):
             try:
                 r = await client.post(
                     f"{JITLER_URL}/search",
@@ -145,6 +146,7 @@ async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 )
                 if r.status_code in (429, 403):
+                    errors.append(f"key[{i}] {r.status_code}: {r.text[:80]}")
                     continue
                 if r.status_code == 200:
                     data = r.json()
@@ -162,10 +164,13 @@ async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
                                 break
                     return data
                 if r.status_code == 501:
+                    errors.append(f"key[{i}] 501")
                     continue
-            except Exception:
+                errors.append(f"key[{i}] {r.status_code}: {r.text[:80]}")
+            except Exception as e:
+                errors.append(f"key[{i}] {e}")
                 continue
-    return {"error": "all jitler keys failed"}
+    return {"error": "all jitler keys failed", "details": errors}
 
 async def jitler_cached(db: Session, type_: str, query: str, page: int = 1) -> dict:
     cache_key = f"{type_}:{query.lower()}:{page}"
@@ -176,6 +181,7 @@ async def jitler_cached(db: Session, type_: str, query: str, page: int = 1) -> d
         except Exception:
             pass
     result = await jitler_request(type_, query, page)
+    # Кэшируем только успешные ответы (без error)
     if "error" not in result:
         if cached:
             cached.response = json.dumps(result, ensure_ascii=False)
@@ -197,21 +203,50 @@ async def pant_request(endpoint: str, params: dict) -> dict:
             try:
                 return r.json()
             except Exception:
-                return {"error": r.status_code, "text": r.text}
+                return {"error": f"{r.status_code} - {r.text[:100]}"}
     except Exception as e:
         return {"error": str(e)}
 
 async def pant_cached(db: Session, endpoint: str, query: str) -> dict:
     cache_key = f"pant:{endpoint}:{query.lower()}"
     cached = db.query(PantCache).filter(PantCache.query == cache_key).first()
+
     if cached and (time.time() - cached.created) < CACHE_TTL:
         try:
-            return json.loads(cached.response)
+            data = json.loads(cached.response)
+            err = str(data.get("error", "")) if isinstance(data, dict) else ""
+            # Не кэшируем "Invalid format" и прочие 400 — пробуем заново
+            if err and "400" not in err:
+                return data
+            if not err:
+                return data
+            # Если 400 — удаляем и пробуем снова
+            db.delete(cached)
+            db.commit()
         except Exception:
             pass
-    params = {"phone": query} if endpoint == "search_phone" else {"q": query}
-    result = await pant_request(endpoint, params)
-    if "error" not in result:
+
+    async def try_q(q_val):
+        if endpoint == "search_phone":
+            return await pant_request(endpoint, {"phone": q_val})
+        return await pant_request(endpoint, {"q": q_val})
+
+    # Первая попытка — как есть
+    result = await try_q(query)
+
+    # Если 400 Invalid format — попробуем поменять формат
+    err = str(result.get("error", "")) if isinstance(result, dict) else ""
+    if "400" in err or "Invalid format" in err:
+        if endpoint == "search":
+            if query.startswith("@"):
+                alt = query.lstrip("@").strip()
+            else:
+                alt = "@" + query.strip()
+            result = await try_q(alt)
+
+    # Кэшируем только не-400
+    err2 = str(result.get("error", "")) if isinstance(result, dict) else ""
+    if "400" not in err2:
         if cached:
             cached.response = json.dumps(result, ensure_ascii=False)
             cached.created = int(time.time())
@@ -219,6 +254,7 @@ async def pant_cached(db: Session, endpoint: str, query: str) -> dict:
             db.add(PantCache(query=cache_key, type=endpoint,
                 response=json.dumps(result, ensure_ascii=False), created=int(time.time())))
         db.commit()
+
     return result
 
 # ========== HTMLWEB ==========
@@ -267,16 +303,21 @@ async def search_telegram(q: str, page: int = 1, api_key: str = Depends(check_ap
         func.lower(Person.telegram).like(f"%{q.lower()}%"),
         func.lower(Person.extra).like(f"%{q.lower()}%"),
     )).limit(20).all()
-    clean = q.lstrip("@").strip()        # для Jitler (без @)
-raw = q.strip()                       # для Pant (как есть, с @)
 
-sherlock = await jitler_cached(db, "sherlock", clean, page)
-funstat = await jitler_cached(db, "funstat", clean, page)
-pant = await pant_cached(db, "search", raw)
+    clean = q.lstrip("@").strip()   # для Jitler
+    raw = q.strip()                 # для Pant (с @, как есть)
+
+    sherlock = await jitler_cached(db, "sherlock", clean, page)
+    funstat = await jitler_cached(db, "funstat", clean, page)
+    pant = await pant_cached(db, "search", raw)
+
     return {
         "query": q, "type": "telegram",
         "local": [PersonResponse.model_validate(p).model_dump() for p in local],
-        "external": {"jitler": {"sherlock": sherlock, "funstat": funstat}, "pant": pant},
+        "external": {
+            "jitler": {"sherlock": sherlock, "funstat": funstat},
+            "pant": pant,
+        },
     }
 
 # -------- 3. НИК --------
@@ -383,10 +424,8 @@ def get_by_phone(phone: str, api_key: str = Depends(check_api_key), db: Session 
 
 @app.post("/persons", response_model=PersonResponse)
 def create_person(person: PersonCreate, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
-    # Нормализуем телефон
     if person.phone:
         person.phone = normalize_phone(person.phone)
-    # Формируем uniq
     if not person.uniq:
         person.uniq = make_uniq(person.phone, person.fio, person.dob)
 
