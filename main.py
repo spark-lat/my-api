@@ -133,17 +133,13 @@ def make_uniq(phone, fio, dob):
     return "f:" + hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
 
 def tg_format(q: str) -> str:
-    """Оба API хотят @ для username. Числовой ID — как есть."""
     q = q.strip()
     if not q:
         return q
-    # если это просто цифры — не трогаем
     if re.fullmatch(r"\d+", q):
         return q
-    # если уже с @ — оставляем
     if q.startswith("@"):
         return q
-    # иначе добавляем @
     return "@" + q
 
 # ========== JITLER ==========
@@ -305,7 +301,6 @@ async def search_telegram(q: str, page: int = 1, api_key: str = Depends(check_ap
         func.lower(Person.extra).like(f"%{q.lower()}%"),
     )).limit(20).all()
 
-    # Оба API хотят @ для username. Числовой ID — как есть.
     formatted = tg_format(q)
 
     sherlock = await jitler_cached(db, "sherlock", formatted, page)
@@ -407,6 +402,55 @@ def ppnd_search(q: str, api_key: str = Depends(check_api_key), db: Session = Dep
             results.append(p)
     return {"query": q, "found": len(results),
             "matches": [PersonResponse.model_validate(p).model_dump() for p in results]}
+
+# -------- 10. ТЕЛЕФОННЫЕ КНИГИ --------
+@app.get("/phonebooks")
+def search_phonebooks(
+    q: str,
+    limit: int = 50,
+    api_key: str = Depends(check_api_key),
+    db: Session = Depends(get_db),
+):
+    local = db.query(Person).filter(
+        func.lower(Person.phonebooks).like(f"%{q.lower()}%")
+    ).limit(limit).all()
+    return {
+        "query": q,
+        "type": "phonebooks",
+        "found": len(local),
+        "matches": [PersonResponse.model_validate(p).model_dump() for p in local],
+    }
+
+# -------- 11. СТАТИСТИКА БАЗЫ --------
+@app.get("/stats")
+def db_stats(api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
+    total = db.query(func.count(Person.id)).scalar() or 0
+
+    def cnt(field):
+        return db.query(func.count(Person.id)).filter(
+            func.coalesce(field, "") != ""
+        ).scalar() or 0
+
+    return {
+        "total": total,
+        "with_phone": cnt(Person.phone),
+        "with_fio": cnt(Person.fio),
+        "with_dob": cnt(Person.dob),
+        "with_passport": cnt(Person.passport),
+        "with_snils": cnt(Person.snils),
+        "with_inn": cnt(Person.inn),
+        "with_address": cnt(Person.address),
+        "with_email": cnt(Person.email),
+        "with_telegram": cnt(Person.telegram),
+        "with_vk": cnt(Person.vk),
+        "with_ok": cnt(Person.ok),
+        "with_instagram": cnt(Person.instagram),
+        "with_tiktok": cnt(Person.tiktok),
+        "with_banks": cnt(Person.banks),
+        "with_phonebooks": cnt(Person.phonebooks),
+        "with_car": cnt(Person.car),
+        "with_extra": cnt(Person.extra),
+    }
 
 # -------- ВСПОМОГАТЕЛЬНЫЕ --------
 @app.get("/persons", response_model=List[PersonResponse])
