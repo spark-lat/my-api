@@ -3,7 +3,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Depends, Query
 from pydantic import BaseModel
 from typing import Optional, List
-from sqlalchemy import create_engine, Column, Integer, String, Text, func, or_
+from sqlalchemy import create_engine, Column, Integer, String, Text, func, or_, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # ========== НАСТРОЙКИ ==========
@@ -39,7 +39,7 @@ def _make_engine(url: str):
         pool_size=3,
         max_overflow=5,
         pool_recycle=300,
-        connect_args={"connect_timeout": 10},
+        connect_args={"connect_timeout": 15},
     )
 
 engine_supabase = _make_engine(SUPABASE_URL)
@@ -101,8 +101,48 @@ class PantCache(Base):
     response = Column(Text)
     created = Column(Integer)
 
+# ========== АВТО-МИГРАЦИЯ ==========
+def _ensure_schema(engine, label: str):
+    """Добавляет отсутствующие колонки в существующую таблицу persons."""
+    if engine is None:
+        return
+    try:
+        with engine.begin() as conn:
+            # Получаем список колонок
+            result = conn.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'persons'
+            """))
+            existing = {row[0] for row in result}
+            print(f"[migrate] {label}: columns = {sorted(existing)}")
+
+            # Колонки, которых может не хватать
+            needed = {
+                "source": "TEXT",
+                "max_link": "TEXT",
+                "whatsapp": "TEXT",
+                "car": "TEXT",
+                "tiktok": "TEXT",
+                "instagram": "TEXT",
+                "ok": "TEXT",
+            }
+            for col, typ in needed.items():
+                if col not in existing:
+                    try:
+                        conn.execute(text(f"ALTER TABLE persons ADD COLUMN {col} {typ}"))
+                        print(f"[migrate] {label}: added column {col}")
+                    except Exception as e:
+                        print(f"[migrate] {label}: {col} - {e}")
+    except Exception as e:
+        print(f"[migrate] {label}: error {e}")
+
 if engine_supabase:
-    Base.metadata.create_all(bind=engine_supabase)
+    _ensure_schema(engine_supabase, "supabase")
+if engine_xata:
+    _ensure_schema(engine_xata, "xata")
+
+if engine_supabase:
+    Base.metadata.create_all(bind=engine_supabase, checkfirst=True)
 
 # ========== СХЕМЫ ==========
 class PersonCreate(BaseModel):
@@ -173,15 +213,13 @@ def tg_format(q: str) -> str:
         return q
     return "@" + q
 
-
 # ========== ОПЕРАТОРЫ ==========
-# Соответствие: оператор → список подстрок в source
 OPERATOR_SOURCE_MAP = {
     "Билайн":   ["beeline", "билайн"],
     "МТС":      ["mts", "мтс"],
     "Мегафон":  ["megafon", "мегафон"],
     "Tele2":    ["tele2", "теле2"],
-    "Т2":       ["t2", "т2", "tele2"],
+    "Т2":       ["t2", "т2"],
     "Yota":     ["yota", "йота"],
     "Сбербанк": ["сбер", "sber"],
     "Альфа-Банк": ["альфа", "alfa"],
@@ -189,7 +227,6 @@ OPERATOR_SOURCE_MAP = {
     "Т-Банк":   ["тинькофф", "tinkoff"],
 }
 
-# Для нормализации: любые записи operator из БД → канон
 OPERATOR_CANON = {
     "билайн": "Билайн", "beeline": "Билайн",
     "мтс": "МТС", "mts": "МТС",
@@ -204,7 +241,6 @@ OPERATOR_CANON = {
 }
 
 def canon_operator(op: str) -> str:
-    """Приводит operator к канону."""
     if not op:
         return ""
     s = str(op).lower().strip()
@@ -213,7 +249,6 @@ def canon_operator(op: str) -> str:
             return v
     return op
 
-# Определение оператора по DEF-коду номера (РФ)
 DEF_OPERATOR = {
     "903": "Билайн", "905": "Билайн", "906": "Билайн", "909": "Билайн",
     "960": "Билайн", "961": "Билайн", "962": "Билайн", "963": "Билайн",
@@ -242,7 +277,6 @@ def detect_operator_by_phone(phone: str) -> str:
     return DEF_OPERATOR.get(p[1:4], "")
 
 def detect_operator_from_persons(persons: list, query_phone: str = "") -> str:
-    """Сначала пробуем поле operator, потом по DEF, потом по source."""
     for d in persons:
         op = canon_operator(d.get("operator") or "")
         if op:
@@ -251,14 +285,12 @@ def detect_operator_from_persons(persons: list, query_phone: str = "") -> str:
         op = detect_operator_by_phone(query_phone)
         if op:
             return op
-    # По source
     for d in persons:
         src = (d.get("source") or "").lower()
         for operator, subs in OPERATOR_SOURCE_MAP.items():
             if any(s in src for s in subs):
                 return operator
     return ""
-
 
 # ========== МЕССЕНДЖЕРЫ ==========
 def build_messengers(phone: str) -> dict:
@@ -274,27 +306,19 @@ def build_messengers(phone: str) -> dict:
         "max":      f"https://max.ru/+{p}",
     }
 
-
 # ========== LEAKS ==========
 def detect_leak_source(source_str: str) -> str:
-    """Преобразует source в человеческое имя утечки."""
     if not source_str:
         return "Прочее"
     s = str(source_str).lower()
-
-    # Операторы
     for operator, subs in OPERATOR_SOURCE_MAP.items():
         if any(sub in s for sub in subs):
             return operator
-
-    # Банки
     if "альфа" in s or "alfa" in s: return "Альфа-Банк"
     if "сбер" in s or "sber" in s: return "Сбербанк"
     if "втб" in s or "vtb" in s: return "ВТБ"
     if "тинькофф" in s or "tinkoff" in s: return "Т-Банк"
     if "русский стандарт" in s: return "Русский Стандарт"
-
-    # Сервисы
     if "gosuslugi" in s or "госуслуги" in s: return "Госуслуги"
     if "гибдд" in s or "гаи" in s: return "ГИБДД"
     if "2gis" in s: return "2GIS"
@@ -310,28 +334,16 @@ def detect_leak_source(source_str: str) -> str:
     if "kari" in s: return "Kari"
     if "вконтакте" in s or "vkontakte" in s or "vk" in s: return "ВКонтакте"
     if "одноклассники" in s or "ok.ru" in s: return "Одноклассники"
-
     return source_str.rsplit(".", 1)[0][:40]
 
 
 def build_leaks(persons: list, operator: str = "") -> list:
-    """
-    Группирует записи по источнику.
-    Если operator задан — оставляет ТОЛЬКО источники этого оператора.
-    """
     groups = {}
     for d in persons:
         src_name = detect_leak_source(d.get("source") or "")
-
-        # Фильтр по оператору
         if operator:
-            # источник должен соответствовать оператору
             if src_name != operator:
-                # но если это не оператор, а сервис (Avito и т.п.) — оставляем? 
-                # По требованию: у человека билайн → показываем только билайн.
-                # Значит всё остальное скрываем.
                 continue
-
         if src_name not in groups:
             groups[src_name] = {
                 "source": src_name,
@@ -361,9 +373,8 @@ def build_leaks(persons: list, operator: str = "") -> list:
         })
     return out
 
-
 # ========== ДВОЙНОЙ ПОИСК ==========
-async def dual_query(query_fn, limit: int = 20):
+async def dual_query(query_fn, limit: int = 50):
     def _do(SessionFactory, src_name):
         if SessionFactory is None:
             return []
@@ -405,7 +416,6 @@ async def dual_query(query_fn, limit: int = 20):
             if len(merged) >= limit:
                 return merged
     return merged
-
 
 # ========== JITLER ==========
 async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
@@ -475,7 +485,6 @@ async def jitler_cached(db, type_: str, query: str, page: int = 1) -> dict:
         db.commit()
     return result
 
-
 # ========== PANT ==========
 async def pant_request(endpoint: str, params: dict) -> dict:
     if not PANT_TOKEN:
@@ -521,7 +530,6 @@ async def pant_cached(db, endpoint: str, query: str) -> dict:
         db.commit()
     return result
 
-
 # ========== HTMLWEB ==========
 async def htmlweb_request(def_code: str) -> dict:
     try:
@@ -533,7 +541,6 @@ async def htmlweb_request(def_code: str) -> dict:
                 return {"error": r.status_code}
     except Exception as e:
         return {"error": str(e)}
-
 
 # ========== ПРИЛОЖЕНИЕ ==========
 app = FastAPI(title="My Base API")
@@ -557,7 +564,7 @@ async def health():
             def _check():
                 s = SessionFactory()
                 try:
-                    s.execute(func.now().select()).scalar()
+                    s.execute(text("SELECT 1"))
                     return "ok"
                 finally:
                     s.close()
@@ -575,33 +582,42 @@ async def search_phone(q: str, page: int = 1,
                         db: Session = Depends(get_db)):
     norm = normalize_phone(q)
 
+    # Простой LIKE (использует индекс, если phone чистый)
     def q_fn(s):
         return s.query(Person).filter(
-            func.regexp_replace(Person.phone, r"\D", "", "g").like(f"%{norm}%")
+            Person.phone.like(f"%{norm}%")
         ).limit(50).all()
 
     local = await dual_query(q_fn, limit=50)
 
-    # Определяем оператор
+    # Fallback через regexp, если LIKE не дал результатов
+    if not local:
+        def q_fn2(s):
+            return s.query(Person).filter(
+                func.regexp_replace(Person.phone, '[^0-9]', '', 'g').like(f"%{norm}%")
+            ).limit(50).all()
+        local = await dual_query(q_fn2, limit=50)
+
     operator = detect_operator_from_persons(local, norm)
 
-    # Фильтруем local по оператору (оставляем записи того же оператора или без оператора)
-    if operator:
-        filtered_local = []
+    if operator and local:
+        filtered = []
         for d in local:
             op_d = canon_operator(d.get("operator") or "")
             if not op_d or op_d == operator:
-                filtered_local.append(d)
-        local = filtered_local
+                filtered.append(d)
+        if filtered:
+            local = filtered
 
     jitler = await jitler_cached(db, "number", norm, page)
     pant = await pant_cached(db, "search_phone", norm)
 
+    # htmlweb — код страны 7 = Россия
     htmlweb = {}
-    if norm.startswith("7") and len(norm) >= 4:
-        htmlweb = await htmlweb_request(norm[1:4])
-    elif len(norm) >= 3:
-        htmlweb = await htmlweb_request(norm[:3])
+    try:
+        htmlweb = await htmlweb_request("7")
+    except Exception:
+        pass
 
     return {
         "query": q, "type": "phone",
@@ -626,7 +642,7 @@ async def search_telegram(q: str, page: int = 1,
 
     local = await dual_query(q_fn, limit=50)
     operator = detect_operator_from_persons(local)
-    if operator:
+    if operator and local:
         local = [d for d in local
                  if not canon_operator(d.get("operator") or "")
                  or canon_operator(d.get("operator") or "") == operator]
@@ -636,7 +652,6 @@ async def search_telegram(q: str, page: int = 1,
     funstat = await jitler_cached(db, "funstat", formatted, page)
     pant = await pant_cached(db, "search", formatted)
 
-    # Мессенджеры по номеру (если найден в local)
     phone_for_msg = ""
     for d in local:
         if d.get("phone"):
@@ -860,7 +875,7 @@ async def get_by_phone(phone: str, api_key: str = Depends(check_api_key)):
     norm = normalize_phone(phone)
     def q_fn(s):
         return s.query(Person).filter(
-            func.regexp_replace(Person.phone, r"\D", "", "g") == norm
+            func.regexp_replace(Person.phone, '[^0-9]', '', 'g') == norm
         ).limit(1).all()
     res = await dual_query(q_fn, limit=1)
     if not res:
@@ -905,7 +920,7 @@ async def delete_person(phone: str, api_key: str = Depends(check_api_key)):
     s = SessionXata()
     try:
         person = s.query(Person).filter(
-            func.regexp_replace(Person.phone, r"\D", "", "g") == norm
+            func.regexp_replace(Person.phone, '[^0-9]', '', 'g') == norm
         ).first()
         if not person:
             raise HTTPException(status_code=404, detail="Не найдено")
