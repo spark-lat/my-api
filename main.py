@@ -8,26 +8,51 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # ========== НАСТРОЙКИ ==========
 API_KEY = os.getenv("API_KEY", "")
-DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///./mybase.db"
+
+# Supabase — старая база (985k) + кэш-таблицы
+SUPABASE_URL = os.getenv("DATABASE_URL", "")
+# Xata — новая база (7.4M)
+XATA_URL = os.getenv("XATA_DATABASE_URL", "")
+
+def _fix_pg_url(u: str) -> str:
+    if not u:
+        return u
+    if u.startswith("postgres://"):
+        u = u.replace("postgres://", "postgresql://", 1)
+    return u
+
+SUPABASE_URL = _fix_pg_url(SUPABASE_URL)
+XATA_URL = _fix_pg_url(XATA_URL)
 
 JITLER_URL = "https://api.jitler.top"
 JITLER_KEYS = [k.strip() for k in os.getenv("JITLER_KEYS", "").split(",") if k.strip()]
-
 PANT_URL = "https://pant-api.cc.cd"
 PANT_TOKEN = os.getenv("PANT_TOKEN", "")
-
 HTMLWEB_URL = "https://htmlweb.ru/geo/api.php"
-
 CACHE_TTL = 60 * 60 * 24
 
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# ========== ДВА ДВИЖКА ==========
+def _make_engine(url: str):
+    if not url:
+        return None
+    return create_engine(
+        url,
+        pool_pre_ping=True,
+        pool_size=3,
+        max_overflow=5,
+        pool_recycle=300,
+        connect_args={"connect_timeout": 10},
+    )
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-)
-SessionLocal = sessionmaker(bind=engine)
+engine_supabase = _make_engine(SUPABASE_URL)
+engine_xata = _make_engine(XATA_URL)
+
+SessionSupabase = sessionmaker(bind=engine_supabase) if engine_supabase else None
+SessionXata = sessionmaker(bind=engine_xata) if engine_xata else None
+
+print(f"[init] Supabase: {'OK' if engine_supabase else 'OFF'}")
+print(f"[init] Xata:     {'OK' if engine_xata else 'OFF'}")
+
 Base = declarative_base()
 
 # ========== МОДЕЛИ ==========
@@ -59,6 +84,7 @@ class Person(Base):
     car = Column(String)
     extra = Column(String)
 
+
 class JitlerCache(Base):
     __tablename__ = "jitler_cache"
     id = Column(Integer, primary_key=True)
@@ -66,6 +92,7 @@ class JitlerCache(Base):
     type = Column(String)
     response = Column(Text)
     created = Column(Integer)
+
 
 class PantCache(Base):
     __tablename__ = "pant_cache"
@@ -75,7 +102,10 @@ class PantCache(Base):
     response = Column(Text)
     created = Column(Integer)
 
-Base.metadata.create_all(bind=engine)
+# create_all ТОЛЬКО на Supabase (для кэш-таблиц).
+# На Xata таблица persons уже создана вручную.
+if engine_supabase:
+    Base.metadata.create_all(bind=engine_supabase)
 
 # ========== СХЕМЫ ==========
 class PersonCreate(BaseModel):
@@ -109,8 +139,13 @@ class PersonResponse(PersonCreate):
     class Config:
         from_attributes = True
 
+# ========== УТИЛИТЫ ==========
 def get_db():
-    db = SessionLocal()
+    """Сессия Supabase для кэш-таблиц."""
+    if SessionSupabase is None:
+        yield None
+        return
+    db = SessionSupabase()
     try:
         yield db
     finally:
@@ -141,6 +176,54 @@ def tg_format(q: str) -> str:
     if q.startswith("@"):
         return q
     return "@" + q
+
+# ========== ДВОЙНОЙ ПОИСК ==========
+async def dual_query(query_fn, limit: int = 20):
+    """
+    Запускает query_fn в обоих БД параллельно, объединяет, дедуплицирует по uniq.
+    Возвращает список dict с полем _source.
+    """
+    def _do(SessionFactory, src_name):
+        if SessionFactory is None:
+            return []
+        s = SessionFactory()
+        try:
+            rows = query_fn(s)
+            out = []
+            for p in rows:
+                d = PersonResponse.model_validate(p).model_dump()
+                d["_source"] = src_name
+                out.append(d)
+            return out
+        finally:
+            s.close()
+
+    tasks = []
+    if SessionSupabase is not None:
+        tasks.append(asyncio.to_thread(_do, SessionSupabase, "supabase"))
+    if SessionXata is not None:
+        tasks.append(asyncio.to_thread(_do, SessionXata, "xata"))
+
+    if not tasks:
+        return []
+
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    merged = []
+    seen = set()
+    for res in raw_results:
+        if isinstance(res, Exception):
+            print(f"[dual_query] DB error: {type(res).__name__}: {res}")
+            continue
+        for d in res:
+            key = d.get("uniq") or f"{d.get('phone')}|{d.get('fio')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(d)
+            if len(merged) >= limit:
+                return merged
+    return merged
 
 # ========== JITLER ==========
 async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
@@ -182,7 +265,9 @@ async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
                 continue
     return {"error": "all jitler keys failed", "details": errors}
 
-async def jitler_cached(db: Session, type_: str, query: str, page: int = 1) -> dict:
+async def jitler_cached(db: Optional[Session], type_: str, query: str, page: int = 1) -> dict:
+    if db is None:
+        return await jitler_request(type_, query, page)
     cache_key = f"{type_}:{query.lower()}:{page}"
     cached = db.query(JitlerCache).filter(JitlerCache.query == cache_key).first()
     if cached and (time.time() - cached.created) < CACHE_TTL:
@@ -222,7 +307,10 @@ async def pant_request(endpoint: str, params: dict) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
-async def pant_cached(db: Session, endpoint: str, query: str) -> dict:
+async def pant_cached(db: Optional[Session], endpoint: str, query: str) -> dict:
+    if db is None:
+        params = {"phone": query} if endpoint == "search_phone" else {"q": query}
+        return await pant_request(endpoint, params)
     cache_key = f"pant:{endpoint}:{query.lower()}"
     cached = db.query(PantCache).filter(PantCache.query == cache_key).first()
     if cached and (time.time() - cached.created) < CACHE_TTL:
@@ -235,14 +323,8 @@ async def pant_cached(db: Session, endpoint: str, query: str) -> dict:
             db.commit()
         except Exception:
             pass
-
-    if endpoint == "search_phone":
-        params = {"phone": query}
-    else:
-        params = {"q": query}
-
+    params = {"phone": query} if endpoint == "search_phone" else {"q": query}
     result = await pant_request(endpoint, params)
-
     err = str(result.get("error", "")) if isinstance(result, dict) else ""
     if "400" not in err:
         if cached:
@@ -271,45 +353,80 @@ app = FastAPI(title="My Base API")
 
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "supabase": engine_supabase is not None,
+        "xata": engine_xata is not None,
+    }
+
+@app.get("/health")
+async def health():
+    """Проверка обеих БД."""
+    result = {}
+    for name, SessionFactory in [("supabase", SessionSupabase), ("xata", SessionXata)]:
+        if SessionFactory is None:
+            result[name] = "off"
+            continue
+        try:
+            def _check():
+                s = SessionFactory()
+                try:
+                    s.execute(func.now().select()).scalar()
+                    return "ok"
+                finally:
+                    s.close()
+            r = await asyncio.to_thread(_check)
+            result[name] = r
+        except Exception as e:
+            result[name] = f"error: {str(e)[:100]}"
+    return result
 
 # -------- 1. НОМЕР --------
 @app.get("/phone")
 async def search_phone(q: str, page: int = 1, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
     norm = normalize_phone(q)
-    local = db.query(Person).filter(
-        func.regexp_replace(Person.phone, r"\D", "", "g").like(f"%{norm}%")
-    ).limit(20).all()
+
+    def q_fn(s):
+        return s.query(Person).filter(
+            func.regexp_replace(Person.phone, r"\D", "", "g").like(f"%{norm}%")
+        ).limit(20).all()
+
+    local = await dual_query(q_fn, limit=20)
+
     jitler = await jitler_cached(db, "number", norm, page)
     pant = await pant_cached(db, "search_phone", norm)
+
     htmlweb = {}
     if norm.startswith("7") and len(norm) >= 4:
         htmlweb = await htmlweb_request(norm[1:4])
     elif len(norm) >= 3:
         htmlweb = await htmlweb_request(norm[:3])
+
     return {
         "query": q, "type": "phone",
-        "local": [PersonResponse.model_validate(p).model_dump() for p in local],
+        "local": local,
         "external": {"jitler": jitler, "pant": pant, "htmlweb": htmlweb},
     }
 
 # -------- 2. TELEGRAM --------
 @app.get("/telegram")
 async def search_telegram(q: str, page: int = 1, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
-    local = db.query(Person).filter(or_(
-        func.lower(Person.telegram).like(f"%{q.lower()}%"),
-        func.lower(Person.extra).like(f"%{q.lower()}%"),
-    )).limit(20).all()
+    def q_fn(s):
+        return s.query(Person).filter(or_(
+            func.lower(Person.telegram).like(f"%{q.lower()}%"),
+            func.lower(Person.extra).like(f"%{q.lower()}%"),
+        )).limit(20).all()
+
+    local = await dual_query(q_fn, limit=20)
 
     formatted = tg_format(q)
-
     sherlock = await jitler_cached(db, "sherlock", formatted, page)
     funstat = await jitler_cached(db, "funstat", formatted, page)
     pant = await pant_cached(db, "search", formatted)
 
     return {
         "query": q, "type": "telegram",
-        "local": [PersonResponse.model_validate(p).model_dump() for p in local],
+        "local": local,
         "external": {
             "jitler": {"sherlock": sherlock, "funstat": funstat},
             "pant": pant,
@@ -343,35 +460,39 @@ def search_nickname(q: str, api_key: str = Depends(check_api_key)):
 
 # -------- 4. ДОКУМЕНТЫ --------
 @app.get("/documents")
-def search_documents(q: str, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
-    local = db.query(Person).filter(or_(
-        func.lower(Person.passport).like(f"%{q.lower()}%"),
-        func.lower(Person.snils).like(f"%{q.lower()}%"),
-        func.lower(Person.inn).like(f"%{q.lower()}%"),
-    )).limit(20).all()
-    return {"query": q, "type": "documents",
-            "local": [PersonResponse.model_validate(p).model_dump() for p in local]}
+async def search_documents(q: str, api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).filter(or_(
+            func.lower(Person.passport).like(f"%{q.lower()}%"),
+            func.lower(Person.snils).like(f"%{q.lower()}%"),
+            func.lower(Person.inn).like(f"%{q.lower()}%"),
+        )).limit(20).all()
+    local = await dual_query(q_fn, limit=20)
+    return {"query": q, "type": "documents", "local": local}
 
 # -------- 5. ФИО --------
 @app.get("/fio")
-def search_fio(q: str, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
-    local = db.query(Person).filter(func.lower(Person.fio).like(f"%{q.lower()}%")).limit(20).all()
-    return {"query": q, "type": "fio",
-            "local": [PersonResponse.model_validate(p).model_dump() for p in local]}
+async def search_fio(q: str, api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).filter(func.lower(Person.fio).like(f"%{q.lower()}%")).limit(20).all()
+    local = await dual_query(q_fn, limit=20)
+    return {"query": q, "type": "fio", "local": local}
 
 # -------- 6. АДРЕС --------
 @app.get("/address")
-def search_address(q: str, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
-    local = db.query(Person).filter(func.lower(Person.address).like(f"%{q.lower()}%")).limit(20).all()
-    return {"query": q, "type": "address",
-            "local": [PersonResponse.model_validate(p).model_dump() for p in local]}
+async def search_address(q: str, api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).filter(func.lower(Person.address).like(f"%{q.lower()}%")).limit(20).all()
+    local = await dual_query(q_fn, limit=20)
+    return {"query": q, "type": "address", "local": local}
 
 # -------- 7. EXTRA --------
 @app.get("/extra")
-def search_extra(q: str, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
-    local = db.query(Person).filter(func.lower(Person.extra).like(f"%{q.lower()}%")).limit(20).all()
-    return {"query": q, "type": "extra",
-            "local": [PersonResponse.model_validate(p).model_dump() for p in local]}
+async def search_extra(q: str, api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).filter(func.lower(Person.extra).like(f"%{q.lower()}%")).limit(20).all()
+    local = await dual_query(q_fn, limit=20)
+    return {"query": q, "type": "extra", "local": local}
 
 # -------- 8. VKS --------
 @app.get("/vks")
@@ -381,122 +502,154 @@ async def search_vks(q: str, page: int = 1, api_key: str = Depends(check_api_key
 
 # -------- 9. PPND --------
 @app.get("/ppnd")
-def ppnd_search(q: str, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
+async def ppnd_search(q: str, api_key: str = Depends(check_api_key)):
     parts = [p.strip().lower() for p in q.replace(" ", "_").split("_") if p.strip()]
     if not parts:
         raise HTTPException(400, "Пустой запрос")
-    conditions = []
-    for part in parts:
-        conditions.append(func.lower(Person.fio).like(f"%{part}%"))
-        conditions.append(func.lower(Person.address).like(f"%{part}%"))
-        conditions.append(func.lower(Person.region).like(f"%{part}%"))
-        conditions.append(func.lower(Person.country).like(f"%{part}%"))
-        conditions.append(func.lower(Person.dob).like(f"%{part}%"))
-        conditions.append(func.lower(Person.extra).like(f"%{part}%"))
-    rows = db.query(Person).filter(or_(*conditions)).limit(100).all()
+
+    def q_fn(s):
+        conditions = []
+        for part in parts:
+            conditions.append(func.lower(Person.fio).like(f"%{part}%"))
+            conditions.append(func.lower(Person.address).like(f"%{part}%"))
+            conditions.append(func.lower(Person.region).like(f"%{part}%"))
+            conditions.append(func.lower(Person.country).like(f"%{part}%"))
+            conditions.append(func.lower(Person.dob).like(f"%{part}%"))
+            conditions.append(func.lower(Person.extra).like(f"%{part}%"))
+        return s.query(Person).filter(or_(*conditions)).limit(200).all()
+
+    rows = await dual_query(q_fn, limit=200)
+
+    # Пост-фильтр: все parts должны встречаться
     results = []
-    for p in rows:
-        text = " ".join([str(p.fio or ""), str(p.address or ""), str(p.region or ""),
-                        str(p.country or ""), str(p.dob or ""), str(p.extra or "")]).lower()
+    for d in rows:
+        text = " ".join([
+            str(d.get("fio") or ""), str(d.get("address") or ""),
+            str(d.get("region") or ""), str(d.get("country") or ""),
+            str(d.get("dob") or ""), str(d.get("extra") or ""),
+        ]).lower()
         if all(part in text for part in parts):
-            results.append(p)
-    return {"query": q, "found": len(results),
-            "matches": [PersonResponse.model_validate(p).model_dump() for p in results]}
+            results.append(d)
+            if len(results) >= 100:
+                break
+
+    return {"query": q, "found": len(results), "matches": results}
 
 # -------- 10. ТЕЛЕФОННЫЕ КНИГИ --------
 @app.get("/phonebooks")
-def search_phonebooks(
-    q: str,
-    limit: int = 50,
-    api_key: str = Depends(check_api_key),
-    db: Session = Depends(get_db),
-):
-    local = db.query(Person).filter(
-        func.lower(Person.phonebooks).like(f"%{q.lower()}%")
-    ).limit(limit).all()
-    return {
-        "query": q,
-        "type": "phonebooks",
-        "found": len(local),
-        "matches": [PersonResponse.model_validate(p).model_dump() for p in local],
-    }
+async def search_phonebooks(q: str, limit: int = 50, api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).filter(
+            func.lower(Person.phonebooks).like(f"%{q.lower()}%")
+        ).limit(limit).all()
+    matches = await dual_query(q_fn, limit=limit)
+    return {"query": q, "type": "phonebooks", "found": len(matches), "matches": matches}
 
-# -------- 11. СТАТИСТИКА БАЗЫ --------
+# -------- 11. СТАТИСТИКА --------
 @app.get("/stats")
-def db_stats(api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
-    total = db.query(func.count(Person.id)).scalar() or 0
+async def db_stats(api_key: str = Depends(check_api_key)):
+    def one(SessionFactory):
+        if SessionFactory is None:
+            return {"total": 0, "status": "off"}
+        s = SessionFactory()
+        try:
+            total = s.query(func.count(Person.id)).scalar() or 0
+            def cnt(field):
+                return s.query(func.count(Person.id)).filter(
+                    func.coalesce(field, "") != ""
+                ).scalar() or 0
+            return {
+                "total": total,
+                "with_phone": cnt(Person.phone),
+                "with_fio": cnt(Person.fio),
+                "with_dob": cnt(Person.dob),
+                "with_passport": cnt(Person.passport),
+                "with_snils": cnt(Person.snils),
+                "with_inn": cnt(Person.inn),
+                "with_address": cnt(Person.address),
+                "with_email": cnt(Person.email),
+                "with_telegram": cnt(Person.telegram),
+                "with_vk": cnt(Person.vk),
+                "with_ok": cnt(Person.ok),
+                "with_instagram": cnt(Person.instagram),
+                "with_tiktok": cnt(Person.tiktok),
+                "with_banks": cnt(Person.banks),
+                "with_phonebooks": cnt(Person.phonebooks),
+                "with_car": cnt(Person.car),
+                "with_extra": cnt(Person.extra),
+            }
+        finally:
+            s.close()
 
-    def cnt(field):
-        return db.query(func.count(Person.id)).filter(
-            func.coalesce(field, "") != ""
-        ).scalar() or 0
-
+    sb = await asyncio.to_thread(one, SessionSupabase)
+    xa = await asyncio.to_thread(one, SessionXata)
     return {
-        "total": total,
-        "with_phone": cnt(Person.phone),
-        "with_fio": cnt(Person.fio),
-        "with_dob": cnt(Person.dob),
-        "with_passport": cnt(Person.passport),
-        "with_snils": cnt(Person.snils),
-        "with_inn": cnt(Person.inn),
-        "with_address": cnt(Person.address),
-        "with_email": cnt(Person.email),
-        "with_telegram": cnt(Person.telegram),
-        "with_vk": cnt(Person.vk),
-        "with_ok": cnt(Person.ok),
-        "with_instagram": cnt(Person.instagram),
-        "with_tiktok": cnt(Person.tiktok),
-        "with_banks": cnt(Person.banks),
-        "with_phonebooks": cnt(Person.phonebooks),
-        "with_car": cnt(Person.car),
-        "with_extra": cnt(Person.extra),
+        "supabase": sb,
+        "xata": xa,
+        "combined_total": sb.get("total", 0) + xa.get("total", 0),
     }
 
 # -------- ВСПОМОГАТЕЛЬНЫЕ --------
-@app.get("/persons", response_model=List[PersonResponse])
-def get_all(skip: int = 0, limit: int = 100, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
-    return db.query(Person).offset(skip).limit(limit).all()
+@app.get("/persons")
+async def get_all(skip: int = 0, limit: int = 100, api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).offset(skip).limit(limit).all()
+    return await dual_query(q_fn, limit=limit)
 
-@app.get("/persons/{phone}", response_model=PersonResponse)
-def get_by_phone(phone: str, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
+@app.get("/persons/{phone}")
+async def get_by_phone(phone: str, api_key: str = Depends(check_api_key)):
     norm = normalize_phone(phone)
-    person = db.query(Person).filter(
-        func.regexp_replace(Person.phone, r"\D", "", "g") == norm
-    ).first()
-    if not person:
+    def q_fn(s):
+        return s.query(Person).filter(
+            func.regexp_replace(Person.phone, r"\D", "", "g") == norm
+        ).limit(1).all()
+    res = await dual_query(q_fn, limit=1)
+    if not res:
         raise HTTPException(status_code=404, detail="Не найдено")
-    return person
+    return res[0]
 
-@app.post("/persons", response_model=PersonResponse)
-def create_person(person: PersonCreate, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
+@app.post("/persons")
+async def create_person(person: PersonCreate, api_key: str = Depends(check_api_key)):
     if person.phone:
         person.phone = normalize_phone(person.phone)
     if not person.uniq:
         person.uniq = make_uniq(person.phone, person.fio, person.dob)
 
-    existing = db.query(Person).filter(Person.uniq == person.uniq).first()
-    if existing:
-        for k, v in person.model_dump().items():
-            if v is not None:
-                setattr(existing, k, v)
-        db.commit()
-        db.refresh(existing)
-        return existing
+    if SessionXata is None:
+        raise HTTPException(status_code=503, detail="Xata недоступна для записи")
 
-    db_person = Person(**person.model_dump())
-    db.add(db_person)
-    db.commit()
-    db.refresh(db_person)
-    return db_person
+    s = SessionXata()
+    try:
+        existing = s.query(Person).filter(Person.uniq == person.uniq).first()
+        if existing:
+            for k, v in person.model_dump().items():
+                if v is not None:
+                    setattr(existing, k, v)
+            s.commit()
+            s.refresh(existing)
+            return PersonResponse.model_validate(existing).model_dump()
+        db_person = Person(**person.model_dump())
+        s.add(db_person)
+        s.commit()
+        s.refresh(db_person)
+        return PersonResponse.model_validate(db_person).model_dump()
+    finally:
+        s.close()
 
 @app.delete("/persons/{phone}")
-def delete_person(phone: str, api_key: str = Depends(check_api_key), db: Session = Depends(get_db)):
+async def delete_person(phone: str, api_key: str = Depends(check_api_key)):
     norm = normalize_phone(phone)
-    person = db.query(Person).filter(
-        func.regexp_replace(Person.phone, r"\D", "", "g") == norm
-    ).first()
-    if not person:
-        raise HTTPException(status_code=404, detail="Не найдено")
-    db.delete(person)
-    db.commit()
-    return {"status": "deleted", "phone": norm}
+    if SessionXata is None:
+        raise HTTPException(status_code=503, detail="Xata недоступна")
+    s = SessionXata()
+    try:
+        person = s.query(Person).filter(
+            func.regexp_replace(Person.phone, r"\D", "", "g") == norm
+        ).first()
+        if not person:
+            raise HTTPException(status_code=404, detail="Не найдено")
+        s.delete(person)
+        s.commit()
+        return {"status": "deleted", "phone": norm}
+    finally:
+        s.close()
