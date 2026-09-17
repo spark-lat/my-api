@@ -36,7 +36,6 @@ print(f"[init] Xata:     {'OK' if engine_xata else 'OFF'}")
 Base = declarative_base()
 
 
-# ========== МОДЕЛИ ==========
 class Person(Base):
     __tablename__ = "persons"
     id = Column(Integer, primary_key=True, index=True)
@@ -85,7 +84,6 @@ class PantCache(Base):
     created = Column(Integer)
 
 
-# ========== СХЕМЫ ==========
 class PersonCreate(BaseModel):
     uniq: Optional[str] = None
     phone: Optional[str] = None
@@ -301,55 +299,243 @@ def classify_leak(d):
     return "Утечка данных"
 
 
-def build_united(persons, operator=""):
-    groups = {}
+def _split_list(val):
+    """'a, b, c' → ['a','b','c'] с очисткой."""
+    if not val:
+        return []
+    out = []
+    for x in re.split(r'[,;]\s*', str(val)):
+        x = x.strip()
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _parse_banks(val):
+    """'Альфа-Банк (Фиал Р. Г.), Банк Русский Стандарт (Рима Ф. М.)' → список."""
+    if not val:
+        return []
+    parts = re.split(r'[,;]\s*(?=[А-ЯA-Z])', str(val))
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        m = re.match(r'^(.+?)\s*\((.+)\)\s*$', p)
+        if m:
+            out.append({"bank": m.group(1).strip(), "fio": m.group(2).strip()})
+        else:
+            out.append({"bank": p, "fio": None})
+    return out
+
+
+def _parse_work(val):
+    """'Южуралникель, обжигальщик' → [{'company': 'Южуралникель', 'position': 'обжигальщик'}]"""
+    if not val:
+        return []
+    out = []
+    for p in re.split(r'[;]\s*', str(val)):
+        p = p.strip()
+        if not p:
+            continue
+        if ',' in p:
+            parts = [x.strip() for x in p.split(',', 1)]
+            out.append({"company": parts[0], "position": parts[1] if len(parts) > 1 else None})
+        else:
+            out.append({"company": p, "position": None})
+    return out
+
+
+# ========== СТРУКТУРИРОВАННЫЙ ОТВЕТ ==========
+def build_structured(persons, query_phone="", operator=""):
+    """
+    Возвращает структурированный ответ:
+    - summary: краткая сводка (одна запись)
+    - leaks: список утечек/источников
+    - banks, work, phonebooks, possible_names: доп. разделы
+    - socials: соцсети
+    - documents: паспорт/снилс/инн
+    - emails: почты
+    Пустые разделы не включаются.
+    """
+    if not persons:
+        return {}
+
+    # Собираем уникальные значения по всем записям
+    fios, dobs, phones, regions, countries, operators = [], [], [], [], [], []
+    emails, telegrams, vks, oks, instagrams, tiktoks = [], [], [], [], [], []
+    phonebooks_set = []
+    banks_all = []
+    work_all = []
+    passports, snilses, innes = [], [], []
+    addresses = []
+    cars = []
+
+    def _add(lst, val):
+        if not val:
+            return
+        for x in _split_list(val):
+            if x and x not in lst:
+                lst.append(x)
+
     for d in persons:
+        _add(fios, d.get("fio"))
+        _add(dobs, d.get("dob"))
+        _add(phones, d.get("phone"))
+        _add(regions, d.get("region"))
+        _add(countries, d.get("country"))
+        _add(operators, d.get("operator"))
+        _add(emails, d.get("email"))
+        _add(telegrams, d.get("telegram"))
+        _add(vks, d.get("vk"))
+        _add(oks, d.get("ok"))
+        _add(instagrams, d.get("instagram"))
+        _add(tiktoks, d.get("tiktok"))
+        _add(passports, d.get("passport"))
+        _add(snilses, d.get("snils"))
+        _add(innes, d.get("inn"))
+        _add(addresses, d.get("address"))
+        _add(cars, d.get("car"))
+
+        # телефонная книга — особый случай (длинный список имён)
+        if d.get("phonebooks"):
+            for x in _split_list(d.get("phonebooks")):
+                if x not in phonebooks_set:
+                    phonebooks_set.append(x)
+
+        # банки — парсим
+        for b in _parse_banks(d.get("banks")):
+            if b not in banks_all:
+                banks_all.append(b)
+
+        # работа — парсим
+        for w in _parse_work(d.get("work")):
+            if w not in work_all:
+                work_all.append(w)
+
+    # Определяем оператора
+    if not operator:
+        operator = operators[0] if operators else detect_operator_by_phone(query_phone)
+
+    # ===== SUMMARY =====
+    summary = {}
+    if phones: summary["phone"] = phones[0]
+    if operator: summary["operator"] = operator
+    if regions: summary["region"] = regions[0]
+    if countries: summary["country"] = countries[0]
+    if fios: summary["fio"] = fios
+    if dobs: summary["dob"] = dobs
+
+    result = {
+        "query": query_phone,
+        "type": "phone",
+        "operator": operator or "не определён",
+    }
+    if summary:
+        result["summary"] = summary
+
+    # ===== LEAKS (только те, что имеют данные) =====
+    leak_groups = {}
+    for d in persons:
+        # фильтр по оператору (мягкий)
         if operator:
             d_op = canon_operator(d.get("operator") or "")
             if d_op and d_op != operator:
                 continue
 
-        leak = classify_leak(d)
-        if leak not in groups:
-            groups[leak] = {"leak": leak}
-            for f in ("fio", "phone", "email", "dob", "address", "passport",
-                      "snils", "inn", "banks", "car", "work",
-                      "telegram", "vk", "ok", "instagram", "tiktok"):
-                groups[leak][f] = None
-        g = groups[leak]
+        src = classify_leak(d)
+        if src not in leak_groups:
+            leak_groups[src] = {"source": src}
+            for f in ("fio", "phone", "email", "address", "passport",
+                      "snils", "inn", "dob", "car"):
+                leak_groups[src][f] = None
 
-        def _join(field, value):
-            if not value:
-                return
-            v = str(value).strip()
+        g = leak_groups[src]
+        for f in ("fio", "phone", "email", "address", "passport",
+                  "snils", "inn", "dob", "car"):
+            v = d.get(f)
             if not v:
-                return
-            if g[field] is None:
-                g[field] = v
-            elif v not in g[field]:
-                g[field] = g[field] + ", " + v
+                continue
+            v = str(v).strip()
+            if not v:
+                continue
+            if g[f] is None:
+                g[f] = v
+            elif v not in g[f]:
+                g[f] = g[f] + ", " + v
 
-        for f in ("fio", "phone", "email", "dob", "address", "passport",
-                  "snils", "inn", "banks", "car", "work",
-                  "telegram", "vk", "ok", "instagram", "tiktok"):
-            _join(f, d.get(f))
-
-    out = []
-    for g in groups.values():
-        has_data = any(g.get(f) for f in ("fio", "phone", "email", "address",
-                                          "passport", "snils", "inn", "banks",
-                                          "car", "work", "telegram", "vk", "ok",
-                                          "instagram", "tiktok"))
-        if not has_data:
+    leaks = []
+    for g in leak_groups.values():
+        # не включаем блок, если у него нет ничего кроме source
+        has = any(g[f] for f in ("fio", "phone", "email", "address",
+                                  "passport", "snils", "inn", "dob", "car"))
+        if not has:
             continue
-        row = {"leak": g["leak"]}
-        for f in ("fio", "phone", "email", "dob", "address", "passport",
-                  "snils", "inn", "banks", "car", "work",
-                  "telegram", "vk", "ok", "instagram", "tiktok"):
-            row[f] = g.get(f) or "—"
-        row["comment"] = "—"
-        out.append(row)
-    return out
+        row = {"source": g["source"]}
+        for f in ("fio", "phone", "email", "address", "passport",
+                  "snils", "inn", "dob", "car"):
+            if g[f]:
+                row[f] = g[f]
+        leaks.append(row)
+
+    if leaks:
+        result["leaks"] = leaks
+
+    # ===== BANKS =====
+    if banks_all:
+        result["banks"] = banks_all
+
+    # ===== WORK =====
+    if work_all:
+        result["work"] = work_all
+
+    # ===== PHONEBOOKS =====
+    if phonebooks_set:
+        result["phonebooks"] = phonebooks_set
+
+    # ===== DOCUMENTS =====
+    docs = {}
+    if passports: docs["passport"] = passports
+    if snilses: docs["snils"] = snilses
+    if innes: docs["inn"] = innes
+    if docs:
+        result["documents"] = docs
+
+    # ===== SOCIALS =====
+    socials = {}
+    if telegrams: socials["telegram"] = telegrams
+    if vks: socials["vk"] = vks
+    if oks: socials["ok"] = oks
+    if instagrams: socials["instagram"] = instagrams
+    if tiktoks: socials["tiktok"] = tiktoks
+    if socials:
+        result["socials"] = socials
+
+    # ===== EMAILS =====
+    if emails:
+        result["emails"] = emails
+
+    # ===== ADDRESSES =====
+    if addresses:
+        result["addresses"] = addresses
+
+    # ===== CARS =====
+    if cars:
+        result["cars"] = cars
+
+    # ===== MESSENGERS =====
+    phone_for_msg = phones[0] if phones else query_phone
+    if phone_for_msg:
+        p = normalize_phone(phone_for_msg)
+        if len(p) == 11:
+            result["messengers"] = {
+                "telegram": f"https://t.me/+{p}",
+                "whatsapp": f"https://wa.me/{p}",
+                "viber": f"viber://chat?number=%2B{p}",
+                "max": f"https://max.ru/+{p}",
+            }
+
+    return result
 
 
 def build_messengers(phone):
@@ -452,7 +638,6 @@ async def jitler_cached(db, type_, query, page=1):
     return result
 
 
-# ========== PANT ==========
 async def pant_request(endpoint, params):
     if not PANT_TOKEN:
         return None
@@ -560,7 +745,7 @@ async def health():
     return res
 
 
-# -------- 1. НОМЕР --------
+# -------- /phone --------
 @app.get("/phone")
 async def search_phone(q: str, page: int = 1,
                        api_key: str = Depends(check_api_key),
@@ -579,13 +764,10 @@ async def search_phone(q: str, page: int = 1,
         local = await dual_query(q_fn2, 50)
 
     operator = detect_operator_from_persons(local, norm)
-    if operator and local:
-        filt = [d for d in local
-                if not canon_operator(d.get("operator") or "")
-                or canon_operator(d.get("operator") or "") == operator]
-        if filt:
-            local = filt
 
+    result = build_structured(local, norm, operator)
+
+    # external (только успешные)
     external = {}
     j = await jitler_cached(db, "number", norm, page)
     if _ok(j):
@@ -593,18 +775,13 @@ async def search_phone(q: str, page: int = 1,
     p = await pant_cached(db, "search_phone", norm)
     if _ok(p):
         external["pant"] = p
+    if external:
+        result["external"] = external
 
-    return {
-        "query": q,
-        "type": "phone",
-        "operator": operator or "не определён",
-        "united": build_united(local, operator),
-        "messengers": build_messengers(norm),
-        **({"external": external} if external else {}),
-    }
+    return result
 
 
-# -------- 2. TELEGRAM --------
+# -------- /telegram --------
 @app.get("/telegram")
 async def search_telegram(q: str, page: int = 1,
                           api_key: str = Depends(check_api_key),
@@ -617,11 +794,9 @@ async def search_telegram(q: str, page: int = 1,
     local = await dual_query(q_fn, 50)
     operator = detect_operator_from_persons(local)
 
-    phone_for_msg = ""
-    for d in local:
-        if d.get("phone"):
-            phone_for_msg = d["phone"]
-            break
+    result = build_structured(local, "", operator)
+    result["query"] = q
+    result["type"] = "telegram"
 
     external = {}
     formatted = tg_format(q)
@@ -634,28 +809,26 @@ async def search_telegram(q: str, page: int = 1,
     p = await pant_cached(db, "search", formatted)
     if _ok(p):
         external["pant"] = p
+    if external:
+        result["external"] = external
 
-    return {
-        "query": q, "type": "telegram",
-        "operator": operator or "не определён",
-        "united": build_united(local, operator),
-        "messengers": build_messengers(phone_for_msg),
-        **({"external": external} if external else {}),
-    }
+    return result
 
 
-# -------- 3. ФИО --------
+# -------- /fio --------
 @app.get("/fio")
 async def search_fio(q: str, api_key: str = Depends(check_api_key)):
     def q_fn(s):
         return s.query(Person).filter(func.lower(Person.fio).like(f"%{q.lower()}%")).limit(50).all()
     local = await dual_query(q_fn, 50)
     operator = detect_operator_from_persons(local)
-    return {"query": q, "type": "fio", "operator": operator or "не определён",
-            "united": build_united(local, operator), "messengers": {}}
+    result = build_structured(local, "", operator)
+    result["query"] = q
+    result["type"] = "fio"
+    return result
 
 
-# -------- 4. ДОКУМЕНТЫ --------
+# -------- /documents --------
 @app.get("/documents")
 async def search_documents(q: str, api_key: str = Depends(check_api_key)):
     def q_fn(s):
@@ -666,46 +839,51 @@ async def search_documents(q: str, api_key: str = Depends(check_api_key)):
         )).limit(50).all()
     local = await dual_query(q_fn, 50)
     operator = detect_operator_from_persons(local)
-    return {"query": q, "type": "documents", "operator": operator or "не определён",
-            "united": build_united(local, operator), "messengers": {}}
+    result = build_structured(local, "", operator)
+    result["query"] = q
+    result["type"] = "documents"
+    return result
 
 
-# -------- 5. АДРЕС --------
+# -------- /address --------
 @app.get("/address")
 async def search_address(q: str, api_key: str = Depends(check_api_key)):
     def q_fn(s):
         return s.query(Person).filter(func.lower(Person.address).like(f"%{q.lower()}%")).limit(50).all()
     local = await dual_query(q_fn, 50)
     operator = detect_operator_from_persons(local)
-    return {"query": q, "type": "address", "operator": operator or "не определён",
-            "united": build_united(local, operator), "messengers": {}}
+    result = build_structured(local, "", operator)
+    result["query"] = q
+    result["type"] = "address"
+    return result
 
 
-# -------- 6. EXTRA --------
+# -------- /extra --------
 @app.get("/extra")
 async def search_extra(q: str, api_key: str = Depends(check_api_key)):
     def q_fn(s):
         return s.query(Person).filter(func.lower(Person.extra).like(f"%{q.lower()}%")).limit(50).all()
     local = await dual_query(q_fn, 50)
     operator = detect_operator_from_persons(local)
-    return {"query": q, "type": "extra", "operator": operator or "не определён",
-            "united": build_united(local, operator), "messengers": {}}
+    result = build_structured(local, "", operator)
+    result["query"] = q
+    result["type"] = "extra"
+    return result
 
 
-# -------- 7. VKS --------
+# -------- /vks --------
 @app.get("/vks")
 async def search_vks(q: str, page: int = 1,
                      api_key: str = Depends(check_api_key),
                      db: Session = Depends(get_db)):
     j = await jitler_cached(db, "vks", q, page)
-    ext = {}
+    result = {"query": q, "type": "vks"}
     if _ok(j):
-        ext["jitler"] = j
-    return {"query": q, "type": "vks", "united": [], "messengers": {},
-            **({"external": ext} if ext else {})}
+        result["external"] = {"jitler": j}
+    return result
 
 
-# -------- 8. PPND --------
+# -------- /ppnd --------
 @app.get("/ppnd")
 async def ppnd_search(q: str, api_key: str = Depends(check_api_key)):
     parts = [p.strip().lower() for p in q.replace(" ", "_").split("_") if p.strip()]
@@ -730,22 +908,25 @@ async def ppnd_search(q: str, api_key: str = Depends(check_api_key)):
             if len(results) >= 100:
                 break
     operator = detect_operator_from_persons(results)
-    return {"query": q, "found": len(results), "operator": operator or "не определён",
-            "united": build_united(results, operator), "messengers": {}}
+    result = build_structured(results, "", operator)
+    result["query"] = q
+    result["type"] = "ppnd"
+    return result
 
 
-# -------- 9. ТЕЛЕФОННЫЕ КНИГИ --------
+# -------- /phonebooks --------
 @app.get("/phonebooks")
 async def search_phonebooks(q: str, limit: int = 50,
                             api_key: str = Depends(check_api_key)):
     def q_fn(s):
         return s.query(Person).filter(func.lower(Person.phonebooks).like(f"%{q.lower()}%")).limit(limit).all()
     m = await dual_query(q_fn, limit)
-    return {"query": q, "type": "phonebooks", "found": len(m),
-            "united": build_united(m), "messengers": {}}
+    result = build_structured(m, "", "")
+    result["query"] = q
+    result["type"] = "phonebooks"
+    return result
 
 
-# -------- 10. НИК --------
 NICKNAME_SITES = {
     "Telegram": "https://t.me/{u}", "VK": "https://vk.com/{u}", "OK": "https://ok.ru/{u}",
     "GitHub": "https://github.com/{u}", "Yandex": "https://yandex.ru/search/?text={u}",
@@ -772,7 +953,6 @@ def search_nickname(q: str, api_key: str = Depends(check_api_key)):
             "links": {name: url.format(u=q) for name, url in NICKNAME_SITES.items()}}
 
 
-# -------- 11. СТАТИСТИКА --------
 @app.get("/stats")
 async def db_stats(api_key: str = Depends(check_api_key)):
     def one(SF):
@@ -789,7 +969,6 @@ async def db_stats(api_key: str = Depends(check_api_key)):
             "combined_total": sb.get("total", 0) + xa.get("total", 0)}
 
 
-# -------- ВСПОМОГАТЕЛЬНЫЕ --------
 @app.get("/persons")
 async def get_all(skip: int = 0, limit: int = 100,
                   api_key: str = Depends(check_api_key)):
