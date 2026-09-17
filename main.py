@@ -6,6 +6,7 @@ from typing import Optional, List
 from sqlalchemy import create_engine, Column, Integer, String, Text, func, or_, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
+# ========== НАСТРОЙКИ ==========
 API_KEY = os.getenv("API_KEY", "")
 SUPABASE_URL = os.getenv("DATABASE_URL", "").replace("postgres://", "postgresql://", 1)
 XATA_URL = os.getenv("XATA_DATABASE_URL", "").replace("postgres://", "postgresql://", 1)
@@ -29,9 +30,13 @@ engine_xata = _make_engine(XATA_URL)
 SessionSupabase = sessionmaker(bind=engine_supabase) if engine_supabase else None
 SessionXata = sessionmaker(bind=engine_xata) if engine_xata else None
 
+print(f"[init] Supabase: {'OK' if engine_supabase else 'OFF'}")
+print(f"[init] Xata:     {'OK' if engine_xata else 'OFF'}")
+
 Base = declarative_base()
 
 
+# ========== МОДЕЛИ ==========
 class Person(Base):
     __tablename__ = "persons"
     id = Column(Integer, primary_key=True, index=True)
@@ -80,44 +85,7 @@ class PantCache(Base):
     created = Column(Integer)
 
 
-def _ensure_schema(engine, label):
-    if engine is None:
-        return
-    try:
-        with engine.begin() as conn:
-            r = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='persons'"))
-            existing = {row[0] for row in r}
-            for col, typ in {"source": "TEXT", "max_link": "TEXT", "whatsapp": "TEXT",
-                             "car": "TEXT", "tiktok": "TEXT", "instagram": "TEXT", "ok": "TEXT"}.items():
-                if col not in existing:
-                    try:
-                        conn.execute(text(f"ALTER TABLE persons ADD COLUMN {col} {typ}"))
-                    except Exception:
-                        pass
-    except Exception as e:
-        print(f"[migrate] {label}: {e}")
-
-
-@app.on_event("startup")
-async def startup_migrate():
-    async def _run():
-        try:
-            if engine_supabase:
-                await asyncio.to_thread(_ensure_schema, engine_supabase, "supabase")
-            if engine_xata:
-                await asyncio.to_thread(_ensure_schema, engine_xata, "xata")
-        except Exception:
-            pass
-    asyncio.create_task(_run())
-
-
-if engine_supabase:
-    try:
-        Base.metadata.create_all(bind=engine_supabase, checkfirst=True)
-    except Exception:
-        pass
-
-
+# ========== СХЕМЫ ==========
 class PersonCreate(BaseModel):
     uniq: Optional[str] = None
     phone: Optional[str] = None
@@ -152,6 +120,7 @@ class PersonResponse(PersonCreate):
         from_attributes = True
 
 
+# ========== УТИЛИТЫ ==========
 def get_db():
     if SessionSupabase is None:
         yield None
@@ -256,7 +225,6 @@ def detect_operator_from_persons(persons, query_phone=""):
     return ""
 
 
-# --- бренды для классификации утечек ---
 BRAND_PATTERNS = [
     (["beeline", "билайн"], "Билайн"),
     (["mts", "мтс"], "МТС"),
@@ -269,7 +237,7 @@ BRAND_PATTERNS = [
     (["тинькофф", "tinkoff", "т-банк"], "Т-Банк"),
     (["русский стандарт"], "Русский Стандарт"),
     (["яндекс еда", "yandex eda", "eda.yandex", "яндекс.еда"], "Яндекс.Еда"),
-    (["яндекс такси", "yandex taxi", "такси"], "Яндекс.Такси"),
+    (["яндекс такси", "yandex taxi"], "Яндекс.Такси"),
     (["яндекс лавка", "lavka"], "Яндекс.Лавка"),
     (["яндекс", "yandex"], "Яндекс"),
     (["самокат", "samokat"], "Самокат"),
@@ -398,6 +366,11 @@ def build_messengers(phone):
     }
 
 
+def _ok(d):
+    return isinstance(d, dict) and d and "error" not in d
+
+
+# ========== ДВОЙНОЙ ПОИСК ==========
 async def dual_query(query_fn, limit=50):
     def _do(SF, name):
         if SF is None:
@@ -431,6 +404,7 @@ async def dual_query(query_fn, limit=50):
     return merged
 
 
+# ========== JITLER ==========
 async def jitler_request(type_, query, page=1):
     if not JITLER_KEYS:
         return None
@@ -478,6 +452,7 @@ async def jitler_cached(db, type_, query, page=1):
     return result
 
 
+# ========== PANT ==========
 async def pant_request(endpoint, params):
     if not PANT_TOKEN:
         return None
@@ -515,12 +490,53 @@ async def pant_cached(db, endpoint, query):
     return result
 
 
+# ========== ПРИЛОЖЕНИЕ ==========
 app = FastAPI(title="My Base API")
+
+if engine_supabase:
+    try:
+        Base.metadata.create_all(bind=engine_supabase, checkfirst=True)
+    except Exception as e:
+        print(f"[create_all] {e}")
+
+
+def _ensure_schema(engine, label):
+    if engine is None:
+        return
+    try:
+        with engine.begin() as conn:
+            r = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='persons'"))
+            existing = {row[0] for row in r}
+            for col, typ in {"source": "TEXT", "max_link": "TEXT", "whatsapp": "TEXT",
+                             "car": "TEXT", "tiktok": "TEXT", "instagram": "TEXT", "ok": "TEXT"}.items():
+                if col not in existing:
+                    try:
+                        conn.execute(text(f"ALTER TABLE persons ADD COLUMN {col} {typ}"))
+                        print(f"[migrate] {label}: added {col}")
+                    except Exception as e:
+                        print(f"[migrate] {label}: {col} - {e}")
+    except Exception as e:
+        print(f"[migrate] {label}: {e}")
+
+
+@app.on_event("startup")
+async def startup_migrate():
+    async def _run():
+        try:
+            if engine_supabase:
+                await asyncio.to_thread(_ensure_schema, engine_supabase, "supabase")
+            if engine_xata:
+                await asyncio.to_thread(_ensure_schema, engine_xata, "xata")
+        except Exception as e:
+            print(f"[startup_migrate] {e}")
+    asyncio.create_task(_run())
 
 
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {"status": "ok",
+            "supabase": engine_supabase is not None,
+            "xata": engine_xata is not None}
 
 
 @app.get("/health")
@@ -544,11 +560,7 @@ async def health():
     return res
 
 
-def _ok(d):
-    """True если d — непустой dict без error."""
-    return isinstance(d, dict) and d and "error" not in d
-
-
+# -------- 1. НОМЕР --------
 @app.get("/phone")
 async def search_phone(q: str, page: int = 1,
                        api_key: str = Depends(check_api_key),
@@ -592,6 +604,7 @@ async def search_phone(q: str, page: int = 1,
     }
 
 
+# -------- 2. TELEGRAM --------
 @app.get("/telegram")
 async def search_telegram(q: str, page: int = 1,
                           api_key: str = Depends(check_api_key),
@@ -631,6 +644,7 @@ async def search_telegram(q: str, page: int = 1,
     }
 
 
+# -------- 3. ФИО --------
 @app.get("/fio")
 async def search_fio(q: str, api_key: str = Depends(check_api_key)):
     def q_fn(s):
@@ -641,6 +655,7 @@ async def search_fio(q: str, api_key: str = Depends(check_api_key)):
             "united": build_united(local, operator), "messengers": {}}
 
 
+# -------- 4. ДОКУМЕНТЫ --------
 @app.get("/documents")
 async def search_documents(q: str, api_key: str = Depends(check_api_key)):
     def q_fn(s):
@@ -655,6 +670,7 @@ async def search_documents(q: str, api_key: str = Depends(check_api_key)):
             "united": build_united(local, operator), "messengers": {}}
 
 
+# -------- 5. АДРЕС --------
 @app.get("/address")
 async def search_address(q: str, api_key: str = Depends(check_api_key)):
     def q_fn(s):
@@ -665,6 +681,7 @@ async def search_address(q: str, api_key: str = Depends(check_api_key)):
             "united": build_united(local, operator), "messengers": {}}
 
 
+# -------- 6. EXTRA --------
 @app.get("/extra")
 async def search_extra(q: str, api_key: str = Depends(check_api_key)):
     def q_fn(s):
@@ -675,6 +692,7 @@ async def search_extra(q: str, api_key: str = Depends(check_api_key)):
             "united": build_united(local, operator), "messengers": {}}
 
 
+# -------- 7. VKS --------
 @app.get("/vks")
 async def search_vks(q: str, page: int = 1,
                      api_key: str = Depends(check_api_key),
@@ -687,6 +705,7 @@ async def search_vks(q: str, page: int = 1,
             **({"external": ext} if ext else {})}
 
 
+# -------- 8. PPND --------
 @app.get("/ppnd")
 async def ppnd_search(q: str, api_key: str = Depends(check_api_key)):
     parts = [p.strip().lower() for p in q.replace(" ", "_").split("_") if p.strip()]
@@ -715,6 +734,7 @@ async def ppnd_search(q: str, api_key: str = Depends(check_api_key)):
             "united": build_united(results, operator), "messengers": {}}
 
 
+# -------- 9. ТЕЛЕФОННЫЕ КНИГИ --------
 @app.get("/phonebooks")
 async def search_phonebooks(q: str, limit: int = 50,
                             api_key: str = Depends(check_api_key)):
@@ -725,6 +745,7 @@ async def search_phonebooks(q: str, limit: int = 50,
             "united": build_united(m), "messengers": {}}
 
 
+# -------- 10. НИК --------
 NICKNAME_SITES = {
     "Telegram": "https://t.me/{u}", "VK": "https://vk.com/{u}", "OK": "https://ok.ru/{u}",
     "GitHub": "https://github.com/{u}", "Yandex": "https://yandex.ru/search/?text={u}",
@@ -751,6 +772,7 @@ def search_nickname(q: str, api_key: str = Depends(check_api_key)):
             "links": {name: url.format(u=q) for name, url in NICKNAME_SITES.items()}}
 
 
+# -------- 11. СТАТИСТИКА --------
 @app.get("/stats")
 async def db_stats(api_key: str = Depends(check_api_key)):
     def one(SF):
@@ -758,8 +780,7 @@ async def db_stats(api_key: str = Depends(check_api_key)):
             return {"total": 0}
         s = SF()
         try:
-            total = s.query(func.count(Person.id)).scalar() or 0
-            return {"total": total}
+            return {"total": s.query(func.count(Person.id)).scalar() or 0}
         finally:
             s.close()
     sb = await asyncio.to_thread(one, SessionSupabase)
@@ -768,6 +789,7 @@ async def db_stats(api_key: str = Depends(check_api_key)):
             "combined_total": sb.get("total", 0) + xa.get("total", 0)}
 
 
+# -------- ВСПОМОГАТЕЛЬНЫЕ --------
 @app.get("/persons")
 async def get_all(skip: int = 0, limit: int = 100,
                   api_key: str = Depends(check_api_key)):
