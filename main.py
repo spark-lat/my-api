@@ -8,7 +8,6 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # ========== НАСТРОЙКИ ==========
 API_KEY = os.getenv("API_KEY", "")
-
 SUPABASE_URL = os.getenv("DATABASE_URL", "")
 XATA_URL = os.getenv("XATA_DATABASE_URL", "")
 
@@ -29,22 +28,17 @@ PANT_TOKEN = os.getenv("PANT_TOKEN", "")
 HTMLWEB_URL = "https://htmlweb.ru/geo/api.php"
 CACHE_TTL = 60 * 60 * 24
 
-# ========== ДВА ДВИЖКА ==========
+# ========== ДВИЖКИ ==========
 def _make_engine(url: str):
     if not url:
         return None
     return create_engine(
-        url,
-        pool_pre_ping=True,
-        pool_size=3,
-        max_overflow=5,
-        pool_recycle=300,
-        connect_args={"connect_timeout": 15},
+        url, pool_pre_ping=True, pool_size=3, max_overflow=5,
+        pool_recycle=300, connect_args={"connect_timeout": 15},
     )
 
 engine_supabase = _make_engine(SUPABASE_URL)
 engine_xata = _make_engine(XATA_URL)
-
 SessionSupabase = sessionmaker(bind=engine_supabase) if engine_supabase else None
 SessionXata = sessionmaker(bind=engine_xata) if engine_xata else None
 
@@ -83,7 +77,6 @@ class Person(Base):
     extra = Column(String)
     source = Column(String)
 
-
 class JitlerCache(Base):
     __tablename__ = "jitler_cache"
     id = Column(Integer, primary_key=True)
@@ -91,7 +84,6 @@ class JitlerCache(Base):
     type = Column(String)
     response = Column(Text)
     created = Column(Integer)
-
 
 class PantCache(Base):
     __tablename__ = "pant_cache"
@@ -101,48 +93,46 @@ class PantCache(Base):
     response = Column(Text)
     created = Column(Integer)
 
-# ========== АВТО-МИГРАЦИЯ ==========
+# ========== МИГРАЦИЯ ==========
 def _ensure_schema(engine, label: str):
-    """Добавляет отсутствующие колонки в существующую таблицу persons."""
     if engine is None:
         return
     try:
         with engine.begin() as conn:
-            # Получаем список колонок
-            result = conn.execute(text("""
-                SELECT column_name FROM information_schema.columns
-                WHERE table_name = 'persons'
-            """))
+            result = conn.execute(text(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'persons'"
+            ))
             existing = {row[0] for row in result}
-            print(f"[migrate] {label}: columns = {sorted(existing)}")
-
-            # Колонки, которых может не хватать
-            needed = {
-                "source": "TEXT",
-                "max_link": "TEXT",
-                "whatsapp": "TEXT",
-                "car": "TEXT",
-                "tiktok": "TEXT",
-                "instagram": "TEXT",
-                "ok": "TEXT",
-            }
+            needed = {"source": "TEXT", "max_link": "TEXT", "whatsapp": "TEXT",
+                      "car": "TEXT", "tiktok": "TEXT", "instagram": "TEXT", "ok": "TEXT"}
             for col, typ in needed.items():
                 if col not in existing:
                     try:
                         conn.execute(text(f"ALTER TABLE persons ADD COLUMN {col} {typ}"))
-                        print(f"[migrate] {label}: added column {col}")
+                        print(f"[migrate] {label}: added {col}")
                     except Exception as e:
                         print(f"[migrate] {label}: {col} - {e}")
+            print(f"[migrate] {label}: ok")
     except Exception as e:
-        print(f"[migrate] {label}: error {e}")
+        print(f"[migrate] {label}: {e}")
+
+@app.on_event("startup")
+async def startup_migrate():
+    async def _run():
+        try:
+            if engine_supabase:
+                await asyncio.to_thread(_ensure_schema, engine_supabase, "supabase")
+            if engine_xata:
+                await asyncio.to_thread(_ensure_schema, engine_xata, "xata")
+        except Exception as e:
+            print(f"[startup_migrate] {e}")
+    asyncio.create_task(_run())
 
 if engine_supabase:
-    _ensure_schema(engine_supabase, "supabase")
-if engine_xata:
-    _ensure_schema(engine_xata, "xata")
-
-if engine_supabase:
-    Base.metadata.create_all(bind=engine_supabase, checkfirst=True)
+    try:
+        Base.metadata.create_all(bind=engine_supabase, checkfirst=True)
+    except Exception:
+        pass
 
 # ========== СХЕМЫ ==========
 class PersonCreate(BaseModel):
@@ -214,19 +204,6 @@ def tg_format(q: str) -> str:
     return "@" + q
 
 # ========== ОПЕРАТОРЫ ==========
-OPERATOR_SOURCE_MAP = {
-    "Билайн":   ["beeline", "билайн"],
-    "МТС":      ["mts", "мтс"],
-    "Мегафон":  ["megafon", "мегафон"],
-    "Tele2":    ["tele2", "теле2"],
-    "Т2":       ["t2", "т2"],
-    "Yota":     ["yota", "йота"],
-    "Сбербанк": ["сбер", "sber"],
-    "Альфа-Банк": ["альфа", "alfa"],
-    "ВТБ":      ["втб", "vtb"],
-    "Т-Банк":   ["тинькофф", "tinkoff"],
-}
-
 OPERATOR_CANON = {
     "билайн": "Билайн", "beeline": "Билайн",
     "мтс": "МТС", "mts": "МТС",
@@ -235,9 +212,9 @@ OPERATOR_CANON = {
     "т2": "Т2", "t2": "Т2",
     "yota": "Yota", "йота": "Yota",
     "сбер": "Сбербанк", "sber": "Сбербанк", "сбербанк": "Сбербанк",
-    "альфа": "Альфа-Банк", "alfa": "Альфа-Банк", "альфа-банк": "Альфа-Банк",
+    "альфа": "Альфа-Банк", "alfa": "Альфа-Банк",
     "втб": "ВТБ", "vtb": "ВТБ",
-    "тинькофф": "Т-Банк", "tinkoff": "Т-Банк", "т-банк": "Т-Банк",
+    "тинькофф": "Т-Банк", "tinkoff": "Т-Банк",
 }
 
 def canon_operator(op: str) -> str:
@@ -285,12 +262,194 @@ def detect_operator_from_persons(persons: list, query_phone: str = "") -> str:
         op = detect_operator_by_phone(query_phone)
         if op:
             return op
-    for d in persons:
-        src = (d.get("source") or "").lower()
-        for operator, subs in OPERATOR_SOURCE_MAP.items():
-            if any(s in src for s in subs):
-                return operator
     return ""
+
+# ========== ОПРЕДЕЛЕНИЕ УТЕЧКИ ==========
+# Бренды по подстроке в source/extra/address
+BRAND_PATTERNS = [
+    (["beeline", "билайн"], "Билайн"),
+    (["mts", "мтс"], "МТС"),
+    (["megafon", "мегафон"], "Мегафон"),
+    (["tele2", "теле2"], "Tele2"),
+    (["yota", "йота"], "Yota"),
+    (["сбер", "sber"], "Сбербанк"),
+    (["альфа", "alfa"], "Альфа-Банк"),
+    (["втб", "vtb"], "ВТБ"),
+    (["тинькофф", "tinkoff", "т-банк"], "Т-Банк"),
+    (["русский стандарт"], "Русский Стандарт"),
+    (["яндекс", "yandex", "еда", "eda", "лавка", "lavka"], "Яндекс"),
+    (["самокат", "samokat"], "Самокат"),
+    (["ozon", "озон"], "Ozon"),
+    (["wildberries", " wb "], "Wildberries"),
+    (["avito", "авито"], "Avito"),
+    (["dns", "днс"], "DNS"),
+    (["сдэк", "cdek", "sdek"], "СДЭК"),
+    (["госуслуги", "gosuslugi"], "Госуслуги"),
+    (["гибдд", "гаи"], "ГИБДД"),
+    (["2gis", "2гис"], "2GIS"),
+    (["zarina"], "Zarina"),
+    (["kari"], "Kari"),
+    (["вконтакте", "vkontakte", "vk.com"], "ВКонтакте"),
+    (["одноклассники", "ok.ru"], "Одноклассники"),
+    (["mail.ru"], "Mail.ru"),
+    (["gmail"], "Gmail"),
+    (["mvideo", "мвидео"], "М.Видео"),
+    (["связной", "svyaznoy"], "Связной"),
+    (["почта", "russianpost", "почты россии"], "Почта России"),
+    (["steam"], "Steam"),
+    (["telegram"], "Telegram"),
+]
+
+def _contains_any(haystack: str, needles: list) -> bool:
+    if not haystack:
+        return False
+    h = str(haystack).lower()
+    return any(n in h for n in needles)
+
+def classify_leak(d: dict) -> str:
+    """
+    Возвращает название утечки/источника для записи.
+    Приоритет: source → extra/address (бренд) → по полям.
+    """
+    # 1. source (имя файла)
+    src = (d.get("source") or "").strip()
+    if src:
+        for needles, name in BRAND_PATTERNS:
+            if _contains_any(src, needles):
+                return name
+        # source без бренда — берём как есть, обрезая
+        return src.rsplit(".", 1)[0][:40]
+
+    # 2. extra или address — ищем бренд
+    for field in ("extra", "address", "work", "banks"):
+        val = d.get(field)
+        if val:
+            for needles, name in BRAND_PATTERNS:
+                if _contains_any(val, needles):
+                    return name
+
+    # 3. По содержимому
+    has = lambda f: bool(d.get(f))
+
+    if has("car"):
+        return "ГИБДД / Авто"
+    if has("banks"):
+        return "Банковская утечка"
+    if has("passport") and (has("snils") or has("inn")):
+        return "Госуслуги"
+    if has("snils") or has("inn"):
+        return "ФНС"
+    if has("passport"):
+        return "Паспортная база"
+    if has("address") and (has("fio") or has("phone")):
+        return "Доставка / Маркетплейс"
+    if has("address"):
+        return "Адресная утечка"
+    if has("phonebooks"):
+        return "Телефонная книга"
+    if has("telegram") or has("vk") or has("ok") or has("instagram") or has("tiktok"):
+        return "Соцсети"
+    if has("email"):
+        return "Почтовая утечка"
+    if has("operator"):
+        return "Оператор связи"
+    return "Утечка данных"
+
+# ========== СБОРКА ОБЪЕДИНЁННЫХ ЗАПИСЕЙ ==========
+def _extract_first(val):
+    """Из строки 'a, b, c' возвращает первое непустое."""
+    if not val:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    return s
+
+def build_united(persons: list, operator: str = "") -> list:
+    """
+    Возвращает объединённые записи с полем leak.
+    Каждая запись = один источник/утечка.
+    """
+    groups = {}
+    for d in persons:
+        # Мягкий фильтр по оператору
+        if operator:
+            d_op = canon_operator(d.get("operator") or "")
+            if d_op and d_op != operator:
+                continue
+
+        leak = classify_leak(d)
+        if leak not in groups:
+            groups[leak] = {
+                "leak": leak,
+                "fio": None, "phone": None, "email": None,
+                "dob": None, "address": None,
+                "passport": None, "snils": None, "inn": None,
+                "banks": None, "car": None, "work": None,
+                "telegram": None, "vk": None, "ok": None,
+                "instagram": None, "tiktok": None,
+                "comment": "—",
+            }
+        g = groups[leak]
+
+        def _join(field, value):
+            if not value:
+                return
+            v = str(value).strip()
+            if not v:
+                return
+            if g[field] is None:
+                g[field] = v
+            elif v not in g[field]:
+                g[field] = g[field] + ", " + v
+
+        _join("fio", d.get("fio"))
+        _join("phone", d.get("phone"))
+        _join("email", d.get("email"))
+        _join("dob", d.get("dob"))
+        _join("address", d.get("address"))
+        _join("passport", d.get("passport"))
+        _join("snils", d.get("snils"))
+        _join("inn", d.get("inn"))
+        _join("banks", d.get("banks"))
+        _join("car", d.get("car"))
+        _join("work", d.get("work"))
+        _join("telegram", d.get("telegram"))
+        _join("vk", d.get("vk"))
+        _join("ok", d.get("ok"))
+        _join("instagram", d.get("instagram"))
+        _join("tiktok", d.get("tiktok"))
+
+    out = []
+    for g in groups.values():
+        # Пропускаем пустые (только leak без данных)
+        has_data = any(g[f] for f in ("fio", "phone", "email", "address",
+                                       "passport", "snils", "inn", "banks",
+                                       "car", "work", "telegram", "vk", "ok",
+                                       "instagram", "tiktok"))
+        if not has_data:
+            continue
+        out.append({
+            "leak":      g["leak"],
+            "fio":       g["fio"] or "—",
+            "phone":     g["phone"] or "—",
+            "email":     g["email"] or "—",
+            "dob":       g["dob"] or "—",
+            "address":   g["address"] or "—",
+            "passport":  g["passport"] or "—",
+            "snils":     g["snils"] or "—",
+            "inn":       g["inn"] or "—",
+            "banks":     g["banks"] or "—",
+            "car":       g["car"] or "—",
+            "work":      g["work"] or "—",
+            "telegram":  g["telegram"] or "—",
+            "vk":        g["vk"] or "—",
+            "ok":        g["ok"] or "—",
+            "instagram": g["instagram"] or "—",
+            "tiktok":    g["tiktok"] or "—",
+            "comment":   "—",
+        })
+    return out
 
 # ========== МЕССЕНДЖЕРЫ ==========
 def build_messengers(phone: str) -> dict:
@@ -305,73 +464,6 @@ def build_messengers(phone: str) -> dict:
         "viber":    f"viber://chat?number=%2B{p}",
         "max":      f"https://max.ru/+{p}",
     }
-
-# ========== LEAKS ==========
-def detect_leak_source(source_str: str) -> str:
-    if not source_str:
-        return "Прочее"
-    s = str(source_str).lower()
-    for operator, subs in OPERATOR_SOURCE_MAP.items():
-        if any(sub in s for sub in subs):
-            return operator
-    if "альфа" in s or "alfa" in s: return "Альфа-Банк"
-    if "сбер" in s or "sber" in s: return "Сбербанк"
-    if "втб" in s or "vtb" in s: return "ВТБ"
-    if "тинькофф" in s or "tinkoff" in s: return "Т-Банк"
-    if "русский стандарт" in s: return "Русский Стандарт"
-    if "gosuslugi" in s or "госуслуги" in s: return "Госуслуги"
-    if "гибдд" in s or "гаи" in s: return "ГИБДД"
-    if "2gis" in s: return "2GIS"
-    if "zarina" in s: return "Zarina"
-    if "avito" in s or "авито" in s: return "Avito"
-    if "ozon" in s or "озон" in s: return "Ozon"
-    if "wildberries" in s or " wb" in s: return "Wildberries"
-    if "dns" in s or "днс" in s: return "DNS"
-    if "сдэк" in s or "cdek" in s: return "СДЭК"
-    if "яндекс" in s or "yandex" in s or "еда" in s: return "Яндекс"
-    if "mail.ru" in s: return "Mail.ru"
-    if "gmail" in s: return "Gmail"
-    if "kari" in s: return "Kari"
-    if "вконтакте" in s or "vkontakte" in s or "vk" in s: return "ВКонтакте"
-    if "одноклассники" in s or "ok.ru" in s: return "Одноклассники"
-    return source_str.rsplit(".", 1)[0][:40]
-
-
-def build_leaks(persons: list, operator: str = "") -> list:
-    groups = {}
-    for d in persons:
-        src_name = detect_leak_source(d.get("source") or "")
-        if operator:
-            if src_name != operator:
-                continue
-        if src_name not in groups:
-            groups[src_name] = {
-                "source": src_name,
-                "fio": None, "phone": None,
-                "email": None, "address": None,
-                "comment": "—",
-            }
-        g = groups[src_name]
-        if not g["fio"] and d.get("fio"):
-            g["fio"] = d["fio"]
-        if not g["phone"] and d.get("phone"):
-            g["phone"] = d["phone"]
-        if not g["email"] and d.get("email"):
-            g["email"] = d["email"]
-        if not g["address"] and d.get("address"):
-            g["address"] = d["address"]
-
-    out = []
-    for g in groups.values():
-        out.append({
-            "source":  g["source"],
-            "fio":     g["fio"] or "—",
-            "phone":   g["phone"] or "—",
-            "email":   g["email"] or "—",
-            "address": g["address"] or "—",
-            "comment": g["comment"],
-        })
-    return out
 
 # ========== ДВОЙНОЙ ПОИСК ==========
 async def dual_query(query_fn, limit: int = 50):
@@ -399,14 +491,12 @@ async def dual_query(query_fn, limit: int = 50):
     if not tasks:
         return []
 
-    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
 
-    merged = []
-    seen = set()
-    for res in raw_results:
+    merged, seen = [], set()
+    for res in raw:
         if isinstance(res, Exception):
-            print(f"[dual_query] DB error: {type(res).__name__}: {res}")
-            continue
+            continue  # ошибки глушим
         for d in res:
             key = d.get("uniq") or f"{d.get('phone')}|{d.get('fio')}"
             if key in seen:
@@ -418,21 +508,17 @@ async def dual_query(query_fn, limit: int = 50):
     return merged
 
 # ========== JITLER ==========
-async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
+async def jitler_request(type_: str, query: str, page: int = 1):
     if not JITLER_KEYS:
-        return {"error": "no jitler keys"}
-    errors = []
+        return None
     async with httpx.AsyncClient(timeout=60) as client:
-        for i, key in enumerate(JITLER_KEYS):
+        for key in JITLER_KEYS:
             try:
                 r = await client.post(
                     f"{JITLER_URL}/search",
                     json={"type": type_, "query": query, "page": page},
                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 )
-                if r.status_code in (429, 403):
-                    errors.append(f"key[{i}] {r.status_code}")
-                    continue
                 if r.status_code == 200:
                     data = r.json()
                     if "id" in data and "response" not in data:
@@ -448,17 +534,11 @@ async def jitler_request(type_: str, query: str, page: int = 1) -> dict:
                             if r2.status_code != 501:
                                 break
                     return data
-                if r.status_code == 501:
-                    errors.append(f"key[{i}] 501")
-                    continue
-                errors.append(f"key[{i}] {r.status_code}")
-            except Exception as e:
-                errors.append(f"key[{i}] {e}")
+            except Exception:
                 continue
-    return {"error": "all jitler keys failed", "details": errors}
+    return None
 
-
-async def jitler_cached(db, type_: str, query: str, page: int = 1) -> dict:
+async def jitler_cached(db, type_: str, query: str, page: int = 1):
     if db is None:
         return await jitler_request(type_, query, page)
     cache_key = f"{type_}:{query.lower()}:{page}"
@@ -466,16 +546,14 @@ async def jitler_cached(db, type_: str, query: str, page: int = 1) -> dict:
     if cached and (time.time() - cached.created) < CACHE_TTL:
         try:
             data = json.loads(cached.response)
-            err = str(data.get("error", "")) if isinstance(data, dict) else ""
-            if "all jitler keys failed" not in err and "Неправильный query" not in err:
+            if isinstance(data, dict) and "error" not in data:
                 return data
             db.delete(cached)
             db.commit()
         except Exception:
             pass
     result = await jitler_request(type_, query, page)
-    is_bad = isinstance(result, dict) and "error" in result
-    if not is_bad:
+    if isinstance(result, dict) and "error" not in result:
         if cached:
             cached.response = json.dumps(result, ensure_ascii=False)
             cached.created = int(time.time())
@@ -486,22 +564,20 @@ async def jitler_cached(db, type_: str, query: str, page: int = 1) -> dict:
     return result
 
 # ========== PANT ==========
-async def pant_request(endpoint: str, params: dict) -> dict:
+async def pant_request(endpoint: str, params: dict):
     if not PANT_TOKEN:
-        return {"error": "no pant token"}
+        return None
     params["token"] = PANT_TOKEN
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(f"{PANT_URL}/{endpoint}", params=params)
-            try:
-                return r.json()
-            except Exception:
-                return {"error": f"{r.status_code} - {r.text[:100]}"}
-    except Exception as e:
-        return {"error": str(e)}
+            if r.status_code != 200:
+                return None
+            return r.json()
+    except Exception:
+        return None
 
-
-async def pant_cached(db, endpoint: str, query: str) -> dict:
+async def pant_cached(db, endpoint: str, query: str):
     if db is None:
         params = {"phone": query} if endpoint == "search_phone" else {"q": query}
         return await pant_request(endpoint, params)
@@ -509,18 +585,12 @@ async def pant_cached(db, endpoint: str, query: str) -> dict:
     cached = db.query(PantCache).filter(PantCache.query == cache_key).first()
     if cached and (time.time() - cached.created) < CACHE_TTL:
         try:
-            data = json.loads(cached.response)
-            err = str(data.get("error", "")) if isinstance(data, dict) else ""
-            if "400" not in err:
-                return data
-            db.delete(cached)
-            db.commit()
+            return json.loads(cached.response)
         except Exception:
             pass
     params = {"phone": query} if endpoint == "search_phone" else {"q": query}
     result = await pant_request(endpoint, params)
-    err = str(result.get("error", "")) if isinstance(result, dict) else ""
-    if "400" not in err:
+    if isinstance(result, dict) and "error" not in result:
         if cached:
             cached.response = json.dumps(result, ensure_ascii=False)
             cached.created = int(time.time())
@@ -531,27 +601,24 @@ async def pant_cached(db, endpoint: str, query: str) -> dict:
     return result
 
 # ========== HTMLWEB ==========
-async def htmlweb_request(def_code: str) -> dict:
+async def htmlweb_request(def_code: str):
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(HTMLWEB_URL, params={"json": "", "telcod": def_code})
-            try:
-                return r.json()
-            except Exception:
-                return {"error": r.status_code}
-    except Exception as e:
-        return {"error": str(e)}
+            if r.status_code != 200:
+                return None
+            return r.json()
+    except Exception:
+        return None
 
 # ========== ПРИЛОЖЕНИЕ ==========
 app = FastAPI(title="My Base API")
-
 
 @app.get("/")
 def root():
     return {"status": "ok",
             "supabase": engine_supabase is not None,
             "xata": engine_xata is not None}
-
 
 @app.get("/health")
 async def health():
@@ -568,29 +635,22 @@ async def health():
                     return "ok"
                 finally:
                     s.close()
-            r = await asyncio.to_thread(_check)
-            result[name] = r
+            result[name] = await asyncio.to_thread(_check)
         except Exception as e:
             result[name] = f"error: {str(e)[:100]}"
     return result
 
-
-# -------- 1. НОМЕР --------
+# -------- /phone --------
 @app.get("/phone")
 async def search_phone(q: str, page: int = 1,
-                        api_key: str = Depends(check_api_key),
-                        db: Session = Depends(get_db)):
+                       api_key: str = Depends(check_api_key),
+                       db: Session = Depends(get_db)):
     norm = normalize_phone(q)
 
-    # Простой LIKE (использует индекс, если phone чистый)
     def q_fn(s):
-        return s.query(Person).filter(
-            Person.phone.like(f"%{norm}%")
-        ).limit(50).all()
-
+        return s.query(Person).filter(Person.phone.like(f"%{norm}%")).limit(50).all()
     local = await dual_query(q_fn, limit=50)
 
-    # Fallback через regexp, если LIKE не дал результатов
     if not local:
         def q_fn2(s):
             return s.query(Person).filter(
@@ -600,57 +660,53 @@ async def search_phone(q: str, page: int = 1,
 
     operator = detect_operator_from_persons(local, norm)
 
+    # Фильтр по оператору
     if operator and local:
-        filtered = []
-        for d in local:
-            op_d = canon_operator(d.get("operator") or "")
-            if not op_d or op_d == operator:
-                filtered.append(d)
+        filtered = [d for d in local
+                    if not canon_operator(d.get("operator") or "")
+                    or canon_operator(d.get("operator") or "") == operator]
         if filtered:
             local = filtered
 
-    jitler = await jitler_cached(db, "number", norm, page)
-    pant = await pant_cached(db, "search_phone", norm)
+    united = build_united(local, operator)
 
-    # htmlweb — код страны 7 = Россия
-    htmlweb = {}
-    try:
-        htmlweb = await htmlweb_request("7")
-    except Exception:
-        pass
+    # Мессенджеры
+    messengers = build_messengers(norm)
+
+    # External (только успешные, без error)
+    external = {}
+    j = await jitler_cached(db, "number", norm, page)
+    if j and isinstance(j, dict) and "error" not in j:
+        external["jitler"] = j
+    p = await pant_cached(db, "search_phone", norm)
+    if p and isinstance(p, dict) and "error" not in p:
+        external["pant"] = p
+    h = await htmlweb_request("7")
+    if h and isinstance(h, dict) and "error" not in h:
+        external["htmlweb"] = h
 
     return {
         "query": q, "type": "phone",
         "operator": operator or "не определён",
-        "local": local,
-        "messengers": build_messengers(norm),
-        "leaks": build_leaks(local, operator),
-        "external": {"jitler": jitler, "pant": pant, "htmlweb": htmlweb},
+        "united": united,
+        "messengers": messengers,
+        "external": external,
     }
 
-
-# -------- 2. TELEGRAM --------
+# -------- /telegram --------
 @app.get("/telegram")
 async def search_telegram(q: str, page: int = 1,
-                           api_key: str = Depends(check_api_key),
-                           db: Session = Depends(get_db)):
+                          api_key: str = Depends(check_api_key),
+                          db: Session = Depends(get_db)):
     def q_fn(s):
         return s.query(Person).filter(or_(
             func.lower(Person.telegram).like(f"%{q.lower()}%"),
             func.lower(Person.extra).like(f"%{q.lower()}%"),
         )).limit(50).all()
-
     local = await dual_query(q_fn, limit=50)
     operator = detect_operator_from_persons(local)
-    if operator and local:
-        local = [d for d in local
-                 if not canon_operator(d.get("operator") or "")
-                 or canon_operator(d.get("operator") or "") == operator]
 
-    formatted = tg_format(q)
-    sherlock = await jitler_cached(db, "sherlock", formatted, page)
-    funstat = await jitler_cached(db, "funstat", formatted, page)
-    pant = await pant_cached(db, "search", formatted)
+    united = build_united(local, operator)
 
     phone_for_msg = ""
     for d in local:
@@ -658,20 +714,149 @@ async def search_telegram(q: str, page: int = 1,
             phone_for_msg = d["phone"]
             break
 
+    formatted = tg_format(q)
+    external = {}
+    sherlock = await jitler_cached(db, "sherlock", formatted, page)
+    funstat = await jitler_cached(db, "funstat", formatted, page)
+    if sherlock and isinstance(sherlock, dict) and "error" not in sherlock:
+        external.setdefault("jitler", {})["sherlock"] = sherlock
+    if funstat and isinstance(funstat, dict) and "error" not in funstat:
+        external.setdefault("jitler", {})["funstat"] = funstat
+    pant = await pant_cached(db, "search", formatted)
+    if pant and isinstance(pant, dict) and "error" not in pant:
+        external["pant"] = pant
+
     return {
         "query": q, "type": "telegram",
         "operator": operator or "не определён",
-        "local": local,
+        "united": united,
         "messengers": build_messengers(phone_for_msg),
-        "leaks": build_leaks(local, operator),
-        "external": {
-            "jitler": {"sherlock": sherlock, "funstat": funstat},
-            "pant": pant,
-        },
+        "external": external,
     }
 
+# -------- /fio --------
+@app.get("/fio")
+async def search_fio(q: str, api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).filter(
+            func.lower(Person.fio).like(f"%{q.lower()}%")
+        ).limit(50).all()
+    local = await dual_query(q_fn, limit=50)
+    operator = detect_operator_from_persons(local)
+    return {"query": q, "type": "fio",
+            "operator": operator or "не определён",
+            "united": build_united(local, operator),
+            "messengers": {},
+            "external": {}}
 
-# -------- 3. НИК --------
+# -------- /documents --------
+@app.get("/documents")
+async def search_documents(q: str, api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).filter(or_(
+            func.lower(Person.passport).like(f"%{q.lower()}%"),
+            func.lower(Person.snils).like(f"%{q.lower()}%"),
+            func.lower(Person.inn).like(f"%{q.lower()}%"),
+        )).limit(50).all()
+    local = await dual_query(q_fn, limit=50)
+    operator = detect_operator_from_persons(local)
+    return {"query": q, "type": "documents",
+            "operator": operator or "не определён",
+            "united": build_united(local, operator),
+            "messengers": {},
+            "external": {}}
+
+# -------- /address --------
+@app.get("/address")
+async def search_address(q: str, api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).filter(
+            func.lower(Person.address).like(f"%{q.lower()}%")
+        ).limit(50).all()
+    local = await dual_query(q_fn, limit=50)
+    operator = detect_operator_from_persons(local)
+    return {"query": q, "type": "address",
+            "operator": operator or "не определён",
+            "united": build_united(local, operator),
+            "messengers": {},
+            "external": {}}
+
+# -------- /extra --------
+@app.get("/extra")
+async def search_extra(q: str, api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).filter(
+            func.lower(Person.extra).like(f"%{q.lower()}%")
+        ).limit(50).all()
+    local = await dual_query(q_fn, limit=50)
+    operator = detect_operator_from_persons(local)
+    return {"query": q, "type": "extra",
+            "operator": operator or "не определён",
+            "united": build_united(local, operator),
+            "messengers": {},
+            "external": {}}
+
+# -------- /vks --------
+@app.get("/vks")
+async def search_vks(q: str, page: int = 1,
+                     api_key: str = Depends(check_api_key),
+                     db: Session = Depends(get_db)):
+    j = await jitler_cached(db, "vks", q, page)
+    external = {}
+    if j and isinstance(j, dict) and "error" not in j:
+        external["jitler"] = j
+    return {"query": q, "type": "vks",
+            "united": [], "messengers": {}, "external": external}
+
+# -------- /ppnd --------
+@app.get("/ppnd")
+async def ppnd_search(q: str, api_key: str = Depends(check_api_key)):
+    parts = [p.strip().lower() for p in q.replace(" ", "_").split("_") if p.strip()]
+    if not parts:
+        raise HTTPException(400, "Пустой запрос")
+
+    def q_fn(s):
+        conditions = []
+        for part in parts:
+            for col in (Person.fio, Person.address, Person.region,
+                        Person.country, Person.dob, Person.extra):
+                conditions.append(func.lower(col).like(f"%{part}%"))
+        return s.query(Person).filter(or_(*conditions)).limit(300).all()
+
+    rows = await dual_query(q_fn, limit=300)
+    results = []
+    for d in rows:
+        text = " ".join([
+            str(d.get("fio") or ""), str(d.get("address") or ""),
+            str(d.get("region") or ""), str(d.get("country") or ""),
+            str(d.get("dob") or ""), str(d.get("extra") or ""),
+        ]).lower()
+        if all(part in text for part in parts):
+            results.append(d)
+            if len(results) >= 100:
+                break
+
+    operator = detect_operator_from_persons(results)
+    return {"query": q, "found": len(results),
+            "operator": operator or "не определён",
+            "united": build_united(results, operator),
+            "messengers": {}, "external": {}}
+
+# -------- /phonebooks --------
+@app.get("/phonebooks")
+async def search_phonebooks(q: str, limit: int = 50,
+                            api_key: str = Depends(check_api_key)):
+    def q_fn(s):
+        return s.query(Person).filter(
+            func.lower(Person.phonebooks).like(f"%{q.lower()}%")
+        ).limit(limit).all()
+    matches = await dual_query(q_fn, limit=limit)
+    return {"query": q, "type": "phonebooks",
+            "found": len(matches),
+            "united": build_united(matches),
+            "messengers": {}, "external": {}}
+
+# -------- /nickname --------
 NICKNAME_SITES = {
     "Telegram": "https://t.me/{u}", "VK": "https://vk.com/{u}", "OK": "https://ok.ru/{u}",
     "GitHub": "https://github.com/{u}", "Yandex": "https://yandex.ru/search/?text={u}",
@@ -691,143 +876,13 @@ NICKNAME_SITES = {
     "Enjin": "https://www.enjin.com/profile/{u}", "DDNet": "https://ddnet.org/user/{u}",
 }
 
-
 @app.get("/nickname")
 def search_nickname(q: str, api_key: str = Depends(check_api_key)):
     links = {name: url.format(u=q) for name, url in NICKNAME_SITES.items()}
     return {"query": q, "type": "nickname",
             "gmail": f"{q}@gmail.com", "links": links}
 
-
-# -------- 4. ДОКУМЕНТЫ --------
-@app.get("/documents")
-async def search_documents(q: str, api_key: str = Depends(check_api_key)):
-    def q_fn(s):
-        return s.query(Person).filter(or_(
-            func.lower(Person.passport).like(f"%{q.lower()}%"),
-            func.lower(Person.snils).like(f"%{q.lower()}%"),
-            func.lower(Person.inn).like(f"%{q.lower()}%"),
-        )).limit(50).all()
-    local = await dual_query(q_fn, limit=50)
-    operator = detect_operator_from_persons(local)
-    return {"query": q, "type": "documents",
-            "operator": operator or "не определён",
-            "local": local,
-            "messengers": {},
-            "leaks": build_leaks(local, operator)}
-
-
-# -------- 5. ФИО --------
-@app.get("/fio")
-async def search_fio(q: str, api_key: str = Depends(check_api_key)):
-    def q_fn(s):
-        return s.query(Person).filter(
-            func.lower(Person.fio).like(f"%{q.lower()}%")
-        ).limit(50).all()
-    local = await dual_query(q_fn, limit=50)
-    operator = detect_operator_from_persons(local)
-    return {"query": q, "type": "fio",
-            "operator": operator or "не определён",
-            "local": local,
-            "messengers": {},
-            "leaks": build_leaks(local, operator)}
-
-
-# -------- 6. АДРЕС --------
-@app.get("/address")
-async def search_address(q: str, api_key: str = Depends(check_api_key)):
-    def q_fn(s):
-        return s.query(Person).filter(
-            func.lower(Person.address).like(f"%{q.lower()}%")
-        ).limit(50).all()
-    local = await dual_query(q_fn, limit=50)
-    operator = detect_operator_from_persons(local)
-    return {"query": q, "type": "address",
-            "operator": operator or "не определён",
-            "local": local,
-            "messengers": {},
-            "leaks": build_leaks(local, operator)}
-
-
-# -------- 7. EXTRA --------
-@app.get("/extra")
-async def search_extra(q: str, api_key: str = Depends(check_api_key)):
-    def q_fn(s):
-        return s.query(Person).filter(
-            func.lower(Person.extra).like(f"%{q.lower()}%")
-        ).limit(50).all()
-    local = await dual_query(q_fn, limit=50)
-    operator = detect_operator_from_persons(local)
-    return {"query": q, "type": "extra",
-            "operator": operator or "не определён",
-            "local": local,
-            "messengers": {},
-            "leaks": build_leaks(local, operator)}
-
-
-# -------- 8. VKS --------
-@app.get("/vks")
-async def search_vks(q: str, page: int = 1,
-                      api_key: str = Depends(check_api_key),
-                      db: Session = Depends(get_db)):
-    jitler = await jitler_cached(db, "vks", q, page)
-    return {"query": q, "type": "vks", "external": jitler}
-
-
-# -------- 9. PPND --------
-@app.get("/ppnd")
-async def ppnd_search(q: str, api_key: str = Depends(check_api_key)):
-    parts = [p.strip().lower() for p in q.replace(" ", "_").split("_") if p.strip()]
-    if not parts:
-        raise HTTPException(400, "Пустой запрос")
-
-    def q_fn(s):
-        conditions = []
-        for part in parts:
-            conditions.append(func.lower(Person.fio).like(f"%{part}%"))
-            conditions.append(func.lower(Person.address).like(f"%{part}%"))
-            conditions.append(func.lower(Person.region).like(f"%{part}%"))
-            conditions.append(func.lower(Person.country).like(f"%{part}%"))
-            conditions.append(func.lower(Person.dob).like(f"%{part}%"))
-            conditions.append(func.lower(Person.extra).like(f"%{part}%"))
-        return s.query(Person).filter(or_(*conditions)).limit(300).all()
-
-    rows = await dual_query(q_fn, limit=300)
-
-    results = []
-    for d in rows:
-        text = " ".join([
-            str(d.get("fio") or ""), str(d.get("address") or ""),
-            str(d.get("region") or ""), str(d.get("country") or ""),
-            str(d.get("dob") or ""), str(d.get("extra") or ""),
-        ]).lower()
-        if all(part in text for part in parts):
-            results.append(d)
-            if len(results) >= 100:
-                break
-
-    operator = detect_operator_from_persons(results)
-    return {"query": q, "found": len(results),
-            "operator": operator or "не определён",
-            "matches": results,
-            "leaks": build_leaks(results, operator)}
-
-
-# -------- 10. ТЕЛЕФОННЫЕ КНИГИ --------
-@app.get("/phonebooks")
-async def search_phonebooks(q: str, limit: int = 50,
-                             api_key: str = Depends(check_api_key)):
-    def q_fn(s):
-        return s.query(Person).filter(
-            func.lower(Person.phonebooks).like(f"%{q.lower()}%")
-        ).limit(limit).all()
-    matches = await dual_query(q_fn, limit=limit)
-    return {"query": q, "type": "phonebooks",
-            "found": len(matches),
-            "matches": matches}
-
-
-# -------- 11. СТАТИСТИКА --------
+# -------- /stats --------
 @app.get("/stats")
 async def db_stats(api_key: str = Depends(check_api_key)):
     def one(SessionFactory):
@@ -840,35 +895,30 @@ async def db_stats(api_key: str = Depends(check_api_key)):
                 return s.query(func.count(Person.id)).filter(
                     func.coalesce(field, "") != ""
                 ).scalar() or 0
-            return {
-                "total": total,
-                "with_phone": cnt(Person.phone),
-                "with_fio": cnt(Person.fio),
-                "with_passport": cnt(Person.passport),
-                "with_snils": cnt(Person.snils),
-                "with_inn": cnt(Person.inn),
-                "with_email": cnt(Person.email),
-                "with_telegram": cnt(Person.telegram),
-                "with_vk": cnt(Person.vk),
-                "with_banks": cnt(Person.banks),
-            }
+            return {"total": total,
+                    "with_phone": cnt(Person.phone),
+                    "with_fio": cnt(Person.fio),
+                    "with_passport": cnt(Person.passport),
+                    "with_snils": cnt(Person.snils),
+                    "with_inn": cnt(Person.inn),
+                    "with_email": cnt(Person.email),
+                    "with_telegram": cnt(Person.telegram),
+                    "with_vk": cnt(Person.vk),
+                    "with_banks": cnt(Person.banks)}
         finally:
             s.close()
-
     sb = await asyncio.to_thread(one, SessionSupabase)
     xa = await asyncio.to_thread(one, SessionXata)
     return {"supabase": sb, "xata": xa,
             "combined_total": sb.get("total", 0) + xa.get("total", 0)}
 
-
 # -------- ВСПОМОГАТЕЛЬНЫЕ --------
 @app.get("/persons")
 async def get_all(skip: int = 0, limit: int = 100,
-                   api_key: str = Depends(check_api_key)):
+                  api_key: str = Depends(check_api_key)):
     def q_fn(s):
         return s.query(Person).offset(skip).limit(limit).all()
     return await dual_query(q_fn, limit=limit)
-
 
 @app.get("/persons/{phone}")
 async def get_by_phone(phone: str, api_key: str = Depends(check_api_key)):
@@ -882,14 +932,13 @@ async def get_by_phone(phone: str, api_key: str = Depends(check_api_key)):
         raise HTTPException(status_code=404, detail="Не найдено")
     return res[0]
 
-
 @app.post("/persons")
 async def create_person(person: PersonCreate,
-                         api_key: str = Depends(check_api_key)):
+                        api_key: str = Depends(check_api_key)):
     if person.phone:
         person.phone = normalize_phone(person.phone)
     if SessionXata is None:
-        raise HTTPException(status_code=503, detail="Xata недоступна для записи")
+        raise HTTPException(status_code=503, detail="Xata недоступна")
     s = SessionXata()
     try:
         if not person.uniq:
@@ -910,7 +959,6 @@ async def create_person(person: PersonCreate,
         return PersonResponse.model_validate(db_person).model_dump()
     finally:
         s.close()
-
 
 @app.delete("/persons/{phone}")
 async def delete_person(phone: str, api_key: str = Depends(check_api_key)):
